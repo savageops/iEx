@@ -11,8 +11,13 @@ struct BenchArgs {
     #[arg(help = "Expression used for each benchmark iteration")]
     expr: String,
 
-    #[arg(default_value = ".", help = "Path to scan")]
-    path: PathBuf,
+    #[arg(
+        value_name = "PATH",
+        num_args = 0..,
+        default_value = ".",
+        help = "One or more files or directories to scan"
+    )]
+    paths: Vec<PathBuf>,
 
     #[arg(long, default_value_t = 3)]
     warmup: usize,
@@ -39,7 +44,7 @@ struct BenchSummary {
 fn main() -> Result<()> {
     let args = BenchArgs::parse();
     let plan = ExpressionPlan::parse(&args.expr)?;
-    let mut config = SearchConfig::new(args.path.clone(), plan);
+    let mut config = SearchConfig::from_roots(args.paths.clone(), plan);
     config.threads = args.threads;
 
     for _ in 0..args.warmup {

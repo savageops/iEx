@@ -22,8 +22,13 @@ struct SearchArgs {
     #[arg(help = "Expression, e.g. 'lit:error && re:\\btimeout\\b'")]
     expr: String,
 
-    #[arg(default_value = ".", help = "Root path to scan")]
-    path: PathBuf,
+    #[arg(
+        value_name = "PATH",
+        num_args = 0..,
+        default_value = ".",
+        help = "One or more files or directories to scan"
+    )]
+    paths: Vec<PathBuf>,
 
     #[arg(long)]
     hidden: bool,
@@ -63,7 +68,7 @@ fn main() -> Result<()> {
 
 fn run_search_command(args: SearchArgs) -> Result<()> {
     let plan = ExpressionPlan::parse(&args.expr)?;
-    let mut config = SearchConfig::new(args.path.clone(), plan.clone());
+    let mut config = SearchConfig::from_roots(args.paths.clone(), plan.clone());
     config.include_hidden = args.hidden;
     config.follow_symlinks = args.follow_symlinks;
     config.max_hits = args.max_hits;

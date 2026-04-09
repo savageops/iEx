@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -24,7 +25,7 @@ const MAX_PARALLEL_FAST_COUNT_THREADS: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
-    pub root: PathBuf,
+    pub roots: Vec<PathBuf>,
     pub plan: ExpressionPlan,
     pub include_hidden: bool,
     pub follow_symlinks: bool,
@@ -60,8 +61,15 @@ struct FileScanOutcome {
 
 impl SearchConfig {
     pub fn new(root: PathBuf, plan: ExpressionPlan) -> Self {
+        Self::from_roots(vec![root], plan)
+    }
+
+    pub fn from_roots(mut roots: Vec<PathBuf>, plan: ExpressionPlan) -> Self {
+        if roots.is_empty() {
+            roots.push(PathBuf::from("."));
+        }
         Self {
-            root,
+            roots,
             plan,
             include_hidden: false,
             follow_symlinks: false,
@@ -119,18 +127,22 @@ fn run_search_inner(config: &SearchConfig) -> Result<SearchReport> {
 }
 
 fn discover_files(config: &SearchConfig) -> Result<Vec<PathBuf>> {
-    if std::fs::metadata(&config.root)
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
-    {
-        return Ok(vec![config.root.clone()]);
+    let roots = partition_roots(config);
+    if roots.directory_roots.is_empty() {
+        return Ok(finalize_discovered_files(roots.direct_files, false));
     }
 
-    discover_files_parallel(config)
+    let needs_dedupe = config.roots.len() > 1 || !roots.direct_files.is_empty();
+    let mut files = roots.direct_files;
+    files.extend(discover_files_parallel(config, &roots.directory_roots)?);
+    Ok(finalize_discovered_files(files, needs_dedupe))
 }
 
-fn build_walk_builder(config: &SearchConfig) -> WalkBuilder {
-    let mut builder = WalkBuilder::new(&config.root);
+fn build_walk_builder(config: &SearchConfig, roots: &[PathBuf]) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(&roots[0]);
+    for root in roots.iter().skip(1) {
+        builder.add(root);
+    }
     builder
         .hidden(!config.include_hidden)
         .follow_links(config.follow_symlinks)
@@ -142,8 +154,8 @@ fn build_walk_builder(config: &SearchConfig) -> WalkBuilder {
     builder
 }
 
-fn discover_files_parallel(config: &SearchConfig) -> Result<Vec<PathBuf>> {
-    let builder = build_walk_builder(config);
+fn discover_files_parallel(config: &SearchConfig, roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let builder = build_walk_builder(config, roots);
     let (sender, receiver) = mpsc::channel::<PathBuf>();
     let walker = builder.build_parallel();
     walker.run(|| {
@@ -161,6 +173,44 @@ fn discover_files_parallel(config: &SearchConfig) -> Result<Vec<PathBuf>> {
     let files: Vec<PathBuf> = receiver.into_iter().collect();
 
     Ok(files)
+}
+
+#[derive(Debug)]
+struct RootTargets {
+    direct_files: Vec<PathBuf>,
+    directory_roots: Vec<PathBuf>,
+}
+
+fn partition_roots(config: &SearchConfig) -> RootTargets {
+    let mut direct_files = Vec::new();
+    let mut directory_roots = Vec::new();
+
+    for root in &config.roots {
+        if std::fs::metadata(root)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+        {
+            direct_files.push(root.clone());
+        } else {
+            directory_roots.push(root.clone());
+        }
+    }
+
+    RootTargets {
+        direct_files,
+        directory_roots,
+    }
+}
+
+fn finalize_discovered_files(files: Vec<PathBuf>, dedupe: bool) -> Vec<PathBuf> {
+    if !dedupe {
+        return files;
+    }
+    let mut unique = BTreeSet::new();
+    for path in files {
+        unique.insert(path);
+    }
+    unique.into_iter().collect()
 }
 
 fn auto_threads_for_shape(file_count: usize) -> usize {
@@ -561,5 +611,78 @@ mod tests {
         assert_eq!(files, vec![root.clone()]);
 
         let _ = fs::remove_file(root);
+    }
+
+    #[test]
+    fn discover_files_supports_multiple_directory_roots() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("iex-engine-multi-root-{unique}"));
+        let left = root.join("left");
+        let right = root.join("right");
+        fs::create_dir_all(&left).expect("left dir should be created");
+        fs::create_dir_all(&right).expect("right dir should be created");
+        fs::write(left.join("one.txt"), "needle left\n").expect("left file should write");
+        fs::write(right.join("two.txt"), "needle right\n").expect("right file should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let config = SearchConfig::from_roots(vec![left.clone(), right.clone()], plan);
+        let files = discover_files(&config).expect("multi-root discovery should succeed");
+
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&left.join("one.txt")));
+        assert!(files.contains(&right.join("two.txt")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discover_files_dedupes_file_root_under_directory_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("iex-engine-overlap-root-{unique}"));
+        fs::create_dir_all(&root).expect("root dir should be created");
+        let file = root.join("needle.txt");
+        fs::write(&file, "needle here\n").expect("fixture file should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let config = SearchConfig::from_roots(vec![root.clone(), file.clone()], plan);
+        let files = discover_files(&config).expect("overlap discovery should succeed");
+
+        assert_eq!(files, vec![file.clone()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_search_supports_multiple_roots_end_to_end() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("iex-engine-search-multi-root-{unique}"));
+        let left = root.join("left");
+        let right = root.join("right");
+        fs::create_dir_all(&left).expect("left dir should be created");
+        fs::create_dir_all(&right).expect("right dir should be created");
+        fs::write(left.join("one.txt"), "alpha\nneedle left\n").expect("left file should write");
+        fs::write(right.join("two.txt"), "needle right\n").expect("right file should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let report = run_search(&SearchConfig::from_roots(
+            vec![left.clone(), right.clone()],
+            plan,
+        ))
+        .expect("multi-root search should succeed");
+
+        assert_eq!(report.stats.files_discovered, 2);
+        assert_eq!(report.stats.files_scanned, 2);
+        assert_eq!(report.stats.matches_found, 2);
+
+        let _ = fs::remove_dir_all(root);
     }
 }

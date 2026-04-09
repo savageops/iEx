@@ -19,6 +19,8 @@ Canonical site: [iex.run](https://iex.run)
 ## Search Execution Model
 
 - Direct file roots scan as a single target without walking through ignore traversal first.
+- Multiple file and directory roots can be supplied in one invocation; directory roots share one discovery surface while direct-file roots stay on the existing direct-target path.
+- Overlapping or repeated roots are deduped before scan so mixed file-plus-directory invocations do not double-count work.
 - Very large direct-file `--stats-only` workloads can shard safe fast-count byte ranges across cores inside that same single-file ownership path.
 - Directory roots use one discovered file list, then auto-select scan parallelism from corpus size.
 - Benchmark telemetry should reflect this single ownership path; avoid separate hybrid auto walkers or hidden fallback scan modes.
@@ -85,6 +87,7 @@ Verification:
 ```powershell
 iex --help
 iex search "lit:Sherlock Holmes" . --stats-only
+iex search "006-iex-upstream-harvest-expansion" todo .docs --stats-only
 ```
 
 PowerShell note: `iex` normally resolves to `Invoke-Expression`. The Windows installer takes ownership of the `iex` command name in the current user's PowerShell profile so new sessions resolve to the native iEx binary. `iex.exe` remains directly callable at any time.
