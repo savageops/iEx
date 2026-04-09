@@ -1,3 +1,4 @@
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{anyhow, Result};
 use memchr::memmem;
 use regex::{
@@ -37,13 +38,15 @@ enum Predicate {
 
 #[derive(Debug, Clone)]
 enum RegexFastPath {
+    PlainLiteral {
+        finder: memmem::Finder<'static>,
+    },
     WordBoundaryLiteral {
         literal: Vec<u8>,
         finder: memmem::Finder<'static>,
     },
     LiteralAlternates {
-        literals: Vec<Vec<u8>>,
-        finders: Vec<memmem::Finder<'static>>,
+        automaton: AhoCorasick,
     },
 }
 
@@ -177,11 +180,12 @@ impl ExpressionPlan {
             [Predicate::Regex {
                 bytes, fast_path, ..
             }] => Some(match fast_path {
+                Some(RegexFastPath::PlainLiteral { finder }) => finder.find_iter(haystack).count(),
                 Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                     count_word_boundary_literal_occurrences_bytes(haystack, literal, finder)
                 }
-                Some(RegexFastPath::LiteralAlternates { literals, finders }) => {
-                    count_alternate_literal_occurrences_bytes(haystack, literals, finders)
+                Some(RegexFastPath::LiteralAlternates { automaton }) => {
+                    count_alternate_literal_occurrences_bytes(haystack, automaton)
                 }
                 None => bytes.find_iter(haystack).count(),
             }),
@@ -285,11 +289,12 @@ fn predicate_matches_bytes(predicate: &Predicate, haystack: &[u8]) -> bool {
         Predicate::Regex {
             bytes, fast_path, ..
         } => match fast_path {
+            Some(RegexFastPath::PlainLiteral { finder }) => finder.find(haystack).is_some(),
             Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                 first_word_boundary_literal_column_bytes(haystack, literal, finder).is_some()
             }
-            Some(RegexFastPath::LiteralAlternates { literals, finders }) => {
-                first_alternate_literal_match(haystack, literals, finders, 0).is_some()
+            Some(RegexFastPath::LiteralAlternates { automaton }) => {
+                first_alternate_literal_match(haystack, automaton, 0).is_some()
             }
             None => bytes.is_match(haystack),
         },
@@ -306,12 +311,12 @@ fn predicate_column_bytes(predicate: &Predicate, haystack: &[u8]) -> Option<usiz
         Predicate::Regex {
             bytes, fast_path, ..
         } => match fast_path {
+            Some(RegexFastPath::PlainLiteral { finder }) => finder.find(haystack),
             Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                 first_word_boundary_literal_column_bytes(haystack, literal, finder)
             }
-            Some(RegexFastPath::LiteralAlternates { literals, finders }) => {
-                first_alternate_literal_match(haystack, literals, finders, 0)
-                    .map(|(offset, _)| offset)
+            Some(RegexFastPath::LiteralAlternates { automaton }) => {
+                first_alternate_literal_match(haystack, automaton, 0)
             }
             None => bytes.find(haystack).map(|m| m.start()),
         },
@@ -319,27 +324,43 @@ fn predicate_column_bytes(predicate: &Predicate, haystack: &[u8]) -> Option<usiz
 }
 
 fn classify_regex_fast_path(pattern: &str) -> Option<RegexFastPath> {
-    if let Some(literal) = parse_word_boundary_literal(pattern) {
-        let bytes = literal.into_bytes();
+    let (case_insensitive, core_pattern) = split_case_insensitive_prefix(pattern);
+
+    if let Some(literal) = parse_word_boundary_literal(core_pattern) {
+        if case_insensitive {
+            return None;
+        }
+        let literal = literal.into_bytes();
         return Some(RegexFastPath::WordBoundaryLiteral {
-            finder: owned_finder(&bytes),
-            literal: bytes,
+            finder: owned_finder(&literal),
+            literal,
         });
     }
 
-    let alternates = parse_literal_alternates(pattern)?;
+    if !case_insensitive && is_plain_ascii_literal(core_pattern) {
+        return Some(RegexFastPath::PlainLiteral {
+            finder: owned_finder(core_pattern.as_bytes()),
+        });
+    }
+
+    let alternates = parse_literal_alternates(core_pattern)?;
+    if alternates.len() < 2 {
+        return None;
+    }
+
     let literals: Vec<Vec<u8>> = alternates
         .into_iter()
         .map(|part| part.into_bytes())
         .collect();
-    if literals.len() < 2 {
-        return None;
+    let automaton = build_literal_automaton(literals, case_insensitive)?;
+    Some(RegexFastPath::LiteralAlternates { automaton })
+}
+
+fn split_case_insensitive_prefix(pattern: &str) -> (bool, &str) {
+    if let Some(rest) = pattern.strip_prefix("(?i)") {
+        return (true, rest);
     }
-    let finders = literals
-        .iter()
-        .map(|literal| owned_finder(literal))
-        .collect();
-    Some(RegexFastPath::LiteralAlternates { literals, finders })
+    (false, pattern)
 }
 
 fn parse_word_boundary_literal(pattern: &str) -> Option<String> {
@@ -354,7 +375,7 @@ fn parse_literal_alternates(pattern: &str) -> Option<Vec<String>> {
     let inner = pattern.strip_prefix('(')?.strip_suffix(')')?;
     let mut parts = Vec::new();
     for part in inner.split('|') {
-        if part.is_empty() || !is_ascii_identifier_literal(part) {
+        if part.is_empty() || !is_plain_ascii_literal(part) {
             return None;
         }
         parts.push(part.to_owned());
@@ -387,15 +408,16 @@ fn is_plain_ascii_literal(value: &str) -> bool {
     })
 }
 
-fn is_ascii_identifier_literal(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
 fn owned_finder(needle: &[u8]) -> memmem::Finder<'static> {
     memmem::Finder::new(needle).into_owned()
+}
+
+fn build_literal_automaton(literals: Vec<Vec<u8>>, case_insensitive: bool) -> Option<AhoCorasick> {
+    AhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostFirst)
+        .ascii_case_insensitive(case_insensitive)
+        .build(literals.iter().map(|part| part.as_slice()))
+        .ok()
 }
 
 fn is_ascii_word_byte(byte: u8) -> bool {
@@ -438,49 +460,19 @@ fn count_word_boundary_literal_occurrences_bytes(
 
 fn first_alternate_literal_match(
     haystack: &[u8],
-    literals: &[Vec<u8>],
-    finders: &[memmem::Finder<'static>],
+    automaton: &AhoCorasick,
     start: usize,
-) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize)> = None;
-    for (index, finder) in finders.iter().enumerate() {
-        if literals[index].is_empty() {
-            continue;
-        }
-        let Some(relative) = finder.find(&haystack[start..]) else {
-            continue;
-        };
-        let absolute = start + relative;
-        match best {
-            None => best = Some((absolute, index)),
-            Some((best_offset, best_index)) => {
-                if absolute < best_offset || (absolute == best_offset && index < best_index) {
-                    best = Some((absolute, index));
-                }
-            }
-        }
+) -> Option<usize> {
+    if start >= haystack.len() {
+        return None;
     }
-    best
+    automaton
+        .find(&haystack[start..])
+        .map(|m| start + m.start())
 }
 
-fn count_alternate_literal_occurrences_bytes(
-    haystack: &[u8],
-    literals: &[Vec<u8>],
-    finders: &[memmem::Finder<'static>],
-) -> usize {
-    let mut count = 0usize;
-    let mut cursor = 0usize;
-    while cursor < haystack.len() {
-        let Some((offset, index)) =
-            first_alternate_literal_match(haystack, literals, finders, cursor)
-        else {
-            break;
-        };
-        count += 1;
-        let advance = literals[index].len().max(1);
-        cursor = offset.saturating_add(advance);
-    }
-    count
+fn count_alternate_literal_occurrences_bytes(haystack: &[u8], automaton: &AhoCorasick) -> usize {
+    automaton.find_iter(haystack).count()
 }
 
 #[cfg(test)]
@@ -507,6 +499,32 @@ mod tests {
     fn alternates_fast_path_respects_leftmost_first_order() {
         let plan = ExpressionPlan::parse(r"re:(a|aa)").expect("plan should parse");
         assert_eq!(plan.fast_match_count_no_hits_bytes(b"aa"), Some(2));
+    }
+
+    #[test]
+    fn alternates_fast_path_supports_phrase_literals() {
+        let plan =
+            ExpressionPlan::parse(r"re:(Sherlock Holmes|John Watson)").expect("plan should parse");
+        assert_eq!(
+            plan.fast_match_count_no_hits_bytes(b"Sherlock Holmes + John Watson"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn case_insensitive_literal_fast_path_counts_ascii_matches() {
+        let plan = ExpressionPlan::parse(r"re:(?i)sherlock holmes").expect("plan should parse");
+        assert_eq!(
+            plan.fast_match_count_no_hits_bytes(b"Sherlock Holmes sherlock HOLMES"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn case_insensitive_word_boundary_fast_path_respects_boundaries() {
+        let plan = ExpressionPlan::parse(r"re:(?i)\bpm_resume\b").expect("plan should parse");
+        let haystack = b"xpm_resume PM_RESUME PM_RESUME2 _PM_RESUME_";
+        assert_eq!(plan.fast_match_count_no_hits_bytes(haystack), Some(1));
     }
 
     #[test]

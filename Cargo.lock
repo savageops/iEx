@@ -198,6 +198,7 @@ dependencies = [
 name = "iex-core"
 version = "0.2.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "ignore",
  "memchr",

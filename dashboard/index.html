@@ -171,6 +171,41 @@
       </section>
 
       <section class="card">
+        <h2>Derived Signals</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Signal</th>
+              <th>Value</th>
+              <th>Status</th>
+              <th>How To Read It</th>
+            </tr>
+          </thead>
+          <tbody id="signal-table"></tbody>
+        </table>
+        <p class="empty" id="signal-empty" hidden>No derived signals yet.</p>
+      </section>
+
+      <section class="card">
+        <h2>Competitor Summary</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Competitor</th>
+              <th>Measured Runs</th>
+              <th>Median ms</th>
+              <th>P95 ms</th>
+              <th>Median Ratio (iEx/competitor)</th>
+              <th>iEx Faster %</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="competitor-table"></tbody>
+        </table>
+        <p class="empty" id="competitor-empty" hidden>No competitor data yet.</p>
+      </section>
+
+      <section class="card">
         <h2>Ratio Trend (iEx/rg)</h2>
         <canvas id="ratio-trend" width="1280" height="320"></canvas>
         <p class="muted">1.0x baseline means parity. Above 1.0x means iEx is slower. Below 1.0x means iEx is faster.</p>
@@ -226,6 +261,7 @@
               <th>Speedup %</th>
               <th>iEx ms</th>
               <th>rg ms</th>
+              <th>ugrep ms</th>
               <th>Hotspot</th>
             </tr>
           </thead>
@@ -299,6 +335,10 @@
       const windowState = document.getElementById("window-state");
       const latestState = document.getElementById("latest-state");
       const compareEmpty = document.getElementById("compare-empty");
+      const signalTable = document.getElementById("signal-table");
+      const signalEmpty = document.getElementById("signal-empty");
+      const competitorTable = document.getElementById("competitor-table");
+      const competitorEmpty = document.getElementById("competitor-empty");
       const profileEmpty = document.getElementById("profile-empty");
       const phaseEmpty = document.getElementById("phase-empty");
       const runEmpty = document.getElementById("run-empty");
@@ -368,10 +408,24 @@
           ratio: { median: 0, p95: 0, min: 0, max: 0, cvPct: 0 },
           speedupPct: { median: 0, p95: 0 },
           trend: { direction: "stable", driftPct: 0 },
+          selfImprovement: {
+            available: false,
+            windowSize: 0,
+            baselineIexMs: 0,
+            recentIexMs: 0,
+            improvementPct: 0,
+            direction: "insufficient-data",
+            profileCoveragePct: 0,
+            baselineRunCount: 0,
+            recentRunCount: 0,
+          },
           health: { score: 0, grade: "n/a", classification: "n/a", performanceClass: "n/a" },
           goalHits: { count: 0, pct: 0 },
           outliers: { count: 0, pct: 0, thresholdRatio: 0, dominantProfile: "n/a" },
           hints: [],
+          signals: [],
+          competitorSummary: [],
+          primaryChallenger: null,
           metricIndex: [],
           recent: {
             runCount: 0,
@@ -401,6 +455,13 @@
         if (severity === "high") return "severity-high";
         if (severity === "medium") return "severity-medium";
         return "severity-info";
+      }
+
+      function signalStatusClass(status) {
+        if (status === "good") return "good";
+        if (status === "warn") return "warn";
+        if (status === "bad") return "bad";
+        return "muted";
       }
 
       function classificationBadgeClass(kind) {
@@ -436,13 +497,27 @@
         const trend = sum?.trend || {};
         const outliers = sum?.outliers || {};
         const goalHits = sum?.goalHits || {};
+        const selfImprovement = sum?.selfImprovement || {};
+        const primaryChallenger = sum?.primaryChallenger || null;
         const medianRatio = asNum(ratio.median, 0);
         const p95Ratio = asNum(ratio.p95, 0);
+        const selfPct = asNum(selfImprovement.improvementPct, 0);
+        const selfClass = !selfImprovement.available
+          ? "muted"
+          : selfPct > 0
+            ? "good"
+            : selfPct < 0
+              ? "bad"
+              : "warn";
+        const selfLabel = selfImprovement.available
+          ? `${fmt(selfPct)}% (${selfImprovement.direction || "stable"})`
+          : "n/a";
         const metrics = [
           ["Runs", String(sum?.runCount ?? history.length)],
           ["Median Ratio", `<span class="${ratioClass(medianRatio)}">${ratioLabel(medianRatio)}</span>`],
           ["P95 Ratio", `<span class="${ratioClass(p95Ratio)}">${ratioLabel(p95Ratio)}</span>`],
           ["Median Speedup %", `${fmt(speedup.median)}%`],
+          ["Self Improvement %", `<span class="${selfClass}">${selfLabel}</span>`],
           ["Health", `<span class="${classificationBadgeClass(health.classification)}">${fmt(health.score)} / 100 (${health.grade || "n/a"})</span>`],
           ["Health Class", `<span class="pill ${classificationBadgeClass(health.classification)}">${health.classification || "n/a"}</span>`],
           ["Performance Class", `<span class="pill ${classificationBadgeClass(health.performanceClass)}">${health.performanceClass || "n/a"}</span>`],
@@ -454,6 +529,13 @@
           ["Dominant Hotspot", `${sum?.dominantHotspot || "n/a"}`],
           ["Ratio Range", `${fmt(ratio.min, 3)}x -> ${fmt(ratio.max, 3)}x`],
           ["Ratio CV", `${fmt(ratio.cvPct)}%`],
+          ["Primary Challenger", `${primaryChallenger?.name || "n/a"}`],
+          [
+            "iEx/Challenger",
+            primaryChallenger
+              ? `<span class="${ratioClass(asNum(primaryChallenger?.iexRatio?.median, 0))}">${ratioLabel(asNum(primaryChallenger?.iexRatio?.median, 0))}</span>`
+              : "n/a",
+          ],
         ];
         metricGrid.innerHTML = metrics
           .map(([label, value]) => `<div class="metric"><div class="label">${label}</div><div class="value">${value}</div></div>`)
@@ -464,13 +546,46 @@
         const sum = currentSummary();
         const overall = sum?.overall || {};
         const recent = sum?.recent || {};
+        const selfImprovement = sum?.selfImprovement || {};
+        const challenger = sum?.primaryChallenger || null;
+        const selfWindowLabel = selfImprovement.windowSize > 0
+          ? `prev ${selfImprovement.windowSize}`
+          : "baseline";
+        const selfRecentLabel = selfImprovement.windowSize > 0
+          ? `last ${selfImprovement.windowSize}`
+          : "recent";
         const rows = [
           ["Run count", `${asNum(overall.runCount, 0)}`, `${asNum(recent.runCount, 0)}`],
           ["Median ratio", `${fmt(overall?.ratio?.median, 3)}x`, `${fmt(recent?.ratio?.median, 3)}x`],
           ["P95 ratio", `${fmt(overall?.ratio?.p95, 3)}x`, `${fmt(recent?.ratio?.p95, 3)}x`],
+          ["P99 ratio", `${fmt(overall?.ratio?.p99, 3)}x`, `${fmt(recent?.ratio?.p99, 3)}x`],
           ["Slower runs %", `${fmt(overall?.slowerRuns?.pct)}%`, `${fmt(recent?.slowerRuns?.pct)}%`],
           ["Goal-hit %", `${fmt(overall?.goalHits?.pct)}%`, `${fmt(recent?.goalHits?.pct)}%`],
           ["Volatility CV", `${fmt(overall?.ratio?.cvPct)}%`, `${fmt(recent?.ratio?.cvPct)}%`],
+          ["Robust CV", `${fmt(overall?.ratio?.robustCvPct)}%`, `${fmt(recent?.ratio?.robustCvPct)}%`],
+          ["MAD", `${fmt(overall?.ratio?.mad, 3)}x`, `${fmt(recent?.ratio?.mad, 3)}x`],
+          ["Step jitter", `${fmt(overall?.ratio?.meanAbsDelta, 3)}x`, `${fmt(recent?.ratio?.meanAbsDelta, 3)}x`],
+          ["Scan share", `${fmt(overall?.phaseSharePct?.scanPct?.median)}%`, `${fmt(recent?.phaseSharePct?.scanPct?.median)}%`],
+          [
+            "Primary challenger",
+            challenger?.name || "n/a",
+            challenger ? `${fmt(challenger.durationMs?.median)} ms median` : "n/a",
+          ],
+          [
+            "iEx/challenger ratio",
+            challenger ? `${fmt(challenger.iexRatio?.median, 3)}x` : "n/a",
+            challenger ? `${fmt(challenger.iexRatio?.p95, 3)}x p95` : "n/a",
+          ],
+          [
+            "Self iEx Median ms",
+            selfImprovement.available ? `${fmt(selfImprovement.baselineIexMs)} (${selfWindowLabel})` : "n/a",
+            selfImprovement.available ? `${fmt(selfImprovement.recentIexMs)} (${selfRecentLabel})` : "n/a",
+          ],
+          [
+            "Self Improvement %",
+            selfImprovement.available ? `${fmt(selfImprovement.improvementPct)}%` : "n/a",
+            selfImprovement.available ? `${fmt(selfImprovement.profileCoveragePct)}% profile coverage` : "n/a",
+          ],
         ];
         compareTable.innerHTML = rows
           .map(([signal, left, right]) => `<tr><td>${signal}</td><td>${left}</td><td>${right}</td></tr>`)
@@ -491,6 +606,43 @@
           })
           .join("");
         hintEmpty.hidden = hints.length > 0;
+      }
+
+      function renderSignals() {
+        const signals = currentSummary()?.signals || [];
+        signalTable.innerHTML = signals
+          .map((signal) => {
+            const cls = signalStatusClass(signal.status);
+            return `<tr>
+              <td>${signal.label}</td>
+              <td>${signal.display}</td>
+              <td><span class="pill ${cls}">${signal.status || "n/a"}</span></td>
+              <td>${signal.read}</td>
+            </tr>`;
+          })
+          .join("");
+        signalEmpty.hidden = signals.length > 0;
+      }
+
+      function renderCompetitors() {
+        const competitors = currentSummary()?.competitorSummary || [];
+        competitorTable.innerHTML = competitors
+          .map((competitor) => {
+            const ratio = asNum(competitor?.iexRatio?.median, 0);
+            const status = competitor?.status || "n/a";
+            const statusClass = status === "available" ? "good" : "warn";
+            return `<tr>
+              <td>${competitor.name}</td>
+              <td>${asNum(competitor.availableRuns, 0)} / ${asNum(competitor.runCount, 0)}</td>
+              <td>${competitor.status === "available" ? fmt(competitor?.durationMs?.median) : "n/a"}</td>
+              <td>${competitor.status === "available" ? fmt(competitor?.durationMs?.p95) : "n/a"}</td>
+              <td class="${ratioClass(ratio)}">${competitor.status === "available" ? ratioLabel(ratio) : "n/a"}</td>
+              <td>${competitor.status === "available" ? `${fmt(competitor.iexWinPct)}%` : "n/a"}</td>
+              <td><span class="pill ${statusClass}">${status}</span></td>
+            </tr>`;
+          })
+          .join("");
+        competitorEmpty.hidden = competitors.length > 0;
       }
 
       function renderMetricIndex() {
@@ -611,6 +763,11 @@
           .map((run) => {
             const rg = asNum(run.rgMs, 0);
             const iex = asNum(run.iexMs, 0);
+            const ugrep = asNum(run?.competitors?.ugrep?.durationMs, 0);
+            const ugrepText =
+              run?.competitors?.ugrep?.available && ugrep > 0
+                ? fmt(ugrep)
+                : "n/a";
             const ratio = asNum(run.iexToRgRatio, rg > 0 ? iex / rg : 0);
             return `<tr>
               <td>${new Date(run.timestamp).toLocaleString()}</td>
@@ -619,6 +776,7 @@
               <td>${fmt(run.speedupPct)}%</td>
               <td>${fmt(iex)}</td>
               <td>${fmt(rg)}</td>
+              <td>${ugrepText}</td>
               <td>${run.hotspot || "n/a"}</td>
             </tr>`;
           })
@@ -661,6 +819,8 @@
         renderMetrics();
         renderComparison();
         renderHints();
+        renderSignals();
+        renderCompetitors();
         drawRatioTrend();
         renderProfileTable();
         renderPhaseTable();

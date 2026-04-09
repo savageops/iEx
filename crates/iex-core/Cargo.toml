@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+aho-corasick.workspace = true
 anyhow.workspace = true
 ignore.workspace = true
 memchr.workspace = true

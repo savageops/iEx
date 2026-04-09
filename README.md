@@ -38,6 +38,7 @@ npm run dashboard
   - loop runner (suite-profile stream): `npm run bench:loop -- --loops 1 --build-profile release --warmup 1`
   - legacy synthetic loop runner: `npm run bench:loop:diag -- --loops 1 --build-profile release --warmup 1`
   - live dashboard: `node tools/scripts/dashboard-server.mjs`
+  - optional external contenders are configured in `tools/scripts/competitors.json`; `ripgrep` is the baseline and `ugrep` is the current best-contender lane when available locally
 - Reports:
   - `tools/reports/live-metrics.jsonl` (append-only history)
   - `tools/reports/latest.json` (latest snapshot)
@@ -52,6 +53,8 @@ npm run dashboard
   - `iexProcessOverheadMs`: `iexCliMs - iexMs`
   - `rgMs`: ripgrep CLI wall-clock time
   - `iexToRgRatio`: `iexMs / rgMs` (above 1.0x means iEx slower, below 1.0x means iEx faster)
+  - `competitors.<name>.durationMs`: optional direct-invocation timings for external contenders such as `ugrep`
+  - dashboard summary includes a `Competitor Summary` lane and primary challenger selection when contender data is present
   - Range report includes min/median/p95/max by profile and phase slowdown attribution.
 
 ## Ripgrep harvest
