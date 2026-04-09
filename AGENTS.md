@@ -31,13 +31,14 @@ Build iEx v2 as a simple, clean, capability-complete Rust search engine and benc
 - Maintain strict directory depth hygiene with self-explanatory naming.
 - Favor compile-time boundaries over runtime shims.
 - Minimum change means minimum durable architecture change, not minimum typing.
-- Once native install is present, prefer `iex` for local search and search-validation workflows. Use `rg` for repo archaeology when the task is not about validating iEx behavior or when the current shell has not activated the native iEx command yet.
+- Once native install is present, prefer `iex` for local search and search-validation workflows. Do not use `rg` for local repo search in this workspace unless `iex` is unavailable and that blocker is recorded in evidence.
 - Before any rebuild that could replace `target/release/iex-cli.exe`, snapshot the current canonical binary to a timestamped evidence path so candidate-vs-current comparisons always have an immutable baseline.
 - Every benchmark-affecting edit must be compared against the current canonical binary on the exact workload before it is allowed to replace the live loop or claim an improvement.
+- Live loop promotion is its own proof gate: compare the candidate against the exact binary currently driving the active loop on the full suite with interleaved multi-pair samples, archive the proof artifact, and only then repoint the loop to a timestamped immutable snapshot if the suite-level result shows real gains instead of a one-off lane win.
 - No backfill and no fallback shortcuts.
 - No split-brain architecture.
 
-## Do / DonÃ¢â‚¬â„¢t
+## Do / Don't
 
 ### Do
 - Reverse-engineer best-in-class open source patterns before implementing.
@@ -46,11 +47,11 @@ Build iEx v2 as a simple, clean, capability-complete Rust search engine and benc
 - Record benchmarks with reproducible commands and objective evidence.
 - Keep docs and tests in lockstep with behavior.
 
-### DonÃ¢â‚¬â„¢t
-- DonÃ¢â‚¬â„¢t introduce hidden side channels or one-off integration paths.
-- DonÃ¢â‚¬â„¢t patch symptoms while leaving root-cause architecture unchanged.
-- DonÃ¢â‚¬â„¢t overengineer beyond current objective.
-- DonÃ¢â‚¬â„¢t degrade readability to chase novelty.
+### Don't
+- Don't introduce hidden side channels or one-off integration paths.
+- Don't patch symptoms while leaving root-cause architecture unchanged.
+- Don't overengineer beyond current objective.
+- Don't degrade readability to chase novelty.
 
 ## Why These Rules Exist
 - To keep iEx fast, reliable, and maintainable under aggressive iteration.
@@ -63,7 +64,8 @@ Build iEx v2 as a simple, clean, capability-complete Rust search engine and benc
 2. Plan second: write deterministic todo chains before broad implementation.
 3. Build third: implement atomic slices with contract-driven validation.
 4. Verify always: snapshot `target/release/iex-cli.exe` before rebuilding, then run tests, benchmarks, telemetry checks, and candidate-vs-current-binary comparisons on the exact edited workload before swapping the canonical runner.
-5. Close cleanly: update docs and preserve evidence.
+5. Promote carefully: before changing the active loop, compare against the currently running loop binary on the full suite, pin the promoted binary to a timestamped immutable snapshot, then confirm `tools/reports/latest.json` is reading that snapshot path after the restart.
+6. Close cleanly: update docs and preserve evidence.
 
 ## Where Rules Apply
 - Entire monorepo root and all submodules.
@@ -82,5 +84,6 @@ Build iEx v2 as a simple, clean, capability-complete Rust search engine and benc
 - Test matrix materialized and passing for changed contracts.
 - Benchmark evidence captured with reproducible commands and the timestamped pre-rebuild canonical-binary snapshot path.
 - For performance work, the edited binary is measured against the current canonical binary and only promoted when the comparison proves the change is neutral or better on the target workload.
+- If the active loop is updated, the promoted binary is an immutable snapshot and the dashboard telemetry is verified against that exact path after restart.
 - Docs updated with architecture rationale and usage instructions.
 - No new duplicate ownership or parallel systems introduced.

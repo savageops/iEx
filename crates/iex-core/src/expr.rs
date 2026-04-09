@@ -1,6 +1,6 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{anyhow, Result};
-use memchr::memmem;
+use memchr::{memchr, memchr2, memmem};
 use regex::{
     bytes::{Regex as BytesRegex, RegexBuilder as BytesRegexBuilder},
     Regex,
@@ -41,9 +41,13 @@ enum RegexFastPath {
     PlainLiteral {
         needle_len: usize,
         finder: memmem::Finder<'static>,
+        #[allow(dead_code)]
+        reject_fast: Option<RejectFastGate>,
     },
     AsciiCaseFoldLiteral {
         searcher: AsciiCaseFoldSearcher,
+        #[allow(dead_code)]
+        reject_fast: Option<RejectFastGate>,
     },
     WordBoundaryLiteral {
         literal: Vec<u8>,
@@ -55,6 +59,8 @@ enum RegexFastPath {
     LiteralAlternates {
         automaton: AhoCorasick,
         max_literal_len: usize,
+        #[allow(dead_code)]
+        reject_fast: Option<RejectFastGate>,
     },
 }
 
@@ -62,6 +68,87 @@ enum RegexFastPath {
 struct AsciiCaseFoldSearcher {
     needle: Vec<u8>,
     shift: [usize; 256],
+    anchor: Option<LiteralAnchorPlan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiteralAnchorPlan {
+    offset: usize,
+    byte: u8,
+}
+
+const REJECT_FAST_MIN_LITERAL_LEN: usize = 6;
+const REJECT_FAST_QUICK_PREFIX_LEN: usize = 3;
+const LITERAL_ANCHOR_MIN_LEN: usize = 4;
+const LITERAL_ANCHOR_MIN_DISTINCT_BYTES: usize = 3;
+const LITERAL_ANCHOR_STRONG_RANK_MAX: u16 = 96;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct RejectFastGate {
+    min_literal_len: usize,
+    prefix_len: usize,
+    quick_automaton: AhoCorasick,
+}
+
+#[allow(dead_code)]
+impl RejectFastGate {
+    fn from_literals<'a, I>(literals: I, case_insensitive: bool) -> Option<Self>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let literals: Vec<Vec<u8>> = literals.into_iter().map(|literal| literal.to_vec()).collect();
+        if literals.is_empty()
+            || literals
+                .iter()
+                .any(|literal| literal.len() < REJECT_FAST_MIN_LITERAL_LEN)
+        {
+            return None;
+        }
+
+        let min_literal_len = literals.iter().map(Vec::len).min()?;
+        let prefix_len = min_literal_len.min(REJECT_FAST_QUICK_PREFIX_LEN);
+        let mut prefixes: Vec<Vec<u8>> = Vec::new();
+        for literal in literals {
+            let prefix = literal[..prefix_len].to_vec();
+            if !prefixes.iter().any(|existing| existing == &prefix) {
+                prefixes.push(prefix);
+            }
+        }
+        let quick_automaton = AhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostFirst)
+            .ascii_case_insensitive(case_insensitive)
+            .build(prefixes.iter().map(|prefix| prefix.as_slice()))
+            .ok()?;
+
+        Some(Self {
+            min_literal_len,
+            prefix_len,
+            quick_automaton,
+        })
+    }
+
+    fn could_match_anywhere(&self, haystack: &[u8]) -> bool {
+        if haystack.len() < self.min_literal_len {
+            return false;
+        }
+        self.quick_automaton.find(haystack).is_some()
+    }
+
+    fn could_match_with_start_in_range(&self, haystack: &[u8], start: usize, end: usize) -> bool {
+        if start >= end || haystack.len() < self.min_literal_len {
+            return false;
+        }
+
+        let bounded_end = end.min(haystack.len());
+        let overlap = self.prefix_len.saturating_sub(1);
+        let slice_start = start.saturating_sub(overlap);
+        let slice_end = haystack.len().min(bounded_end.saturating_add(overlap));
+        self.quick_automaton
+            .find_iter(&haystack[slice_start..slice_end])
+            .map(|m| slice_start + m.start())
+            .any(|absolute_start| absolute_start >= start && absolute_start < bounded_end)
+    }
 }
 
 impl AsciiCaseFoldSearcher {
@@ -79,14 +166,71 @@ impl AsciiCaseFoldSearcher {
             }
         }
 
+        let anchor = best_literal_anchor_plan(&folded);
         Some(Self {
             needle: folded,
             shift,
+            anchor,
         })
     }
 
     fn needle_len(&self) -> usize {
         self.needle.len()
+    }
+
+    fn matches_at_anchor(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        anchor: LiteralAnchorPlan,
+    ) -> bool {
+        let needle_len = self.needle.len();
+        if start + needle_len > haystack.len()
+            || !ascii_casefold_eq(haystack[start + anchor.offset], self.needle[anchor.offset])
+        {
+            return false;
+        }
+
+        for needle_idx in anchor.offset + 1..needle_len {
+            if !ascii_casefold_eq(haystack[start + needle_idx], self.needle[needle_idx]) {
+                return false;
+            }
+        }
+        for needle_idx in (0..anchor.offset).rev() {
+            if !ascii_casefold_eq(haystack[start + needle_idx], self.needle[needle_idx]) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn find_with_anchor(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        anchor: LiteralAnchorPlan,
+    ) -> Option<usize> {
+        let needle_len = self.needle.len();
+        let last_candidate_start = haystack.len().checked_sub(needle_len)?;
+        let scan_end = last_candidate_start + anchor.offset + 1;
+        let mut scan_offset = start + anchor.offset;
+        let lower = anchor.byte;
+        let upper = anchor.byte.to_ascii_uppercase();
+
+        while scan_offset < scan_end {
+            let relative = if lower == upper {
+                memchr(lower, &haystack[scan_offset..scan_end])
+            } else {
+                memchr2(lower, upper, &haystack[scan_offset..scan_end])
+            }?;
+            let absolute = scan_offset + relative;
+            let candidate_start = absolute - anchor.offset;
+            if self.matches_at_anchor(haystack, candidate_start, anchor) {
+                return Some(candidate_start);
+            }
+            scan_offset = absolute + 1;
+        }
+        None
     }
 
     fn find(&self, haystack: &[u8], start: usize) -> Option<usize> {
@@ -100,6 +244,10 @@ impl AsciiCaseFoldSearcher {
                 .iter()
                 .position(|&byte| ascii_casefold_eq(byte, self.needle[0]))
                 .map(|offset| start + offset);
+        }
+
+        if let Some(anchor) = self.anchor {
+            return self.find_with_anchor(haystack, start, anchor);
         }
 
         let mut offset = start;
@@ -253,7 +401,7 @@ impl ExpressionPlan {
                 Some(RegexFastPath::PlainLiteral { finder, .. }) => {
                     finder.find_iter(haystack).count()
                 }
-                Some(RegexFastPath::AsciiCaseFoldLiteral { searcher }) => {
+                Some(RegexFastPath::AsciiCaseFoldLiteral { searcher, .. }) => {
                     count_casefold_literal_occurrences_bytes(haystack, searcher)
                 }
                 Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
@@ -290,7 +438,7 @@ impl ExpressionPlan {
 
         match self.compiled.as_slice() {
             [Predicate::Regex { fast_path, .. }] => match fast_path {
-                Some(RegexFastPath::PlainLiteral { needle_len, finder }) => {
+                Some(RegexFastPath::PlainLiteral { needle_len, finder, .. }) => {
                     Some(count_literal_occurrences_bytes_in_range(
                         haystack,
                         finder,
@@ -299,13 +447,13 @@ impl ExpressionPlan {
                         bounded_end,
                     ))
                 }
-                Some(RegexFastPath::AsciiCaseFoldLiteral { searcher }) => {
+                Some(RegexFastPath::AsciiCaseFoldLiteral { searcher, .. }) => {
                     Some(count_casefold_literal_occurrences_bytes_in_range(
-                    haystack,
-                    searcher,
-                    start,
-                    bounded_end,
-                ))
+                        haystack,
+                        searcher,
+                        start,
+                        bounded_end,
+                    ))
                 }
                 Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                     Some(count_word_boundary_literal_occurrences_bytes_in_range(
@@ -327,13 +475,14 @@ impl ExpressionPlan {
                 Some(RegexFastPath::LiteralAlternates {
                     automaton,
                     max_literal_len,
+                    ..
                 }) => Some(count_alternate_literal_occurrences_bytes_in_range(
-                    haystack,
-                    automaton,
-                    *max_literal_len,
-                    start,
-                    bounded_end,
-                )),
+                        haystack,
+                        automaton,
+                        *max_literal_len,
+                        start,
+                        bounded_end,
+                    )),
                 None => None,
             },
             [Predicate::Literal { bytes, finder, .. }] => {
@@ -441,7 +590,7 @@ fn predicate_matches_bytes(predicate: &Predicate, haystack: &[u8]) -> bool {
             bytes, fast_path, ..
         } => match fast_path {
             Some(RegexFastPath::PlainLiteral { finder, .. }) => finder.find(haystack).is_some(),
-            Some(RegexFastPath::AsciiCaseFoldLiteral { searcher }) => {
+            Some(RegexFastPath::AsciiCaseFoldLiteral { searcher, .. }) => {
                 first_casefold_literal_column_bytes(haystack, searcher).is_some()
             }
             Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
@@ -469,7 +618,7 @@ fn predicate_column_bytes(predicate: &Predicate, haystack: &[u8]) -> Option<usiz
             bytes, fast_path, ..
         } => match fast_path {
             Some(RegexFastPath::PlainLiteral { finder, .. }) => finder.find(haystack),
-            Some(RegexFastPath::AsciiCaseFoldLiteral { searcher }) => {
+            Some(RegexFastPath::AsciiCaseFoldLiteral { searcher, .. }) => {
                 first_casefold_literal_column_bytes(haystack, searcher)
             }
             Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
@@ -503,14 +652,18 @@ fn classify_regex_fast_path(pattern: &str) -> Option<RegexFastPath> {
     }
 
     if is_plain_ascii_literal(core_pattern) {
+        let reject_fast =
+            RejectFastGate::from_literals([core_pattern.as_bytes()], case_insensitive);
         if case_insensitive {
             return Some(RegexFastPath::AsciiCaseFoldLiteral {
                 searcher: AsciiCaseFoldSearcher::new(core_pattern.as_bytes())?,
+                reject_fast,
             });
         }
         return Some(RegexFastPath::PlainLiteral {
             needle_len: core_pattern.len(),
             finder: owned_finder(core_pattern.as_bytes()),
+            reject_fast,
         });
     }
 
@@ -524,10 +677,13 @@ fn classify_regex_fast_path(pattern: &str) -> Option<RegexFastPath> {
         .map(|part| part.into_bytes())
         .collect();
     let max_literal_len = literals.iter().map(Vec::len).max()?;
+    let reject_fast =
+        RejectFastGate::from_literals(literals.iter().map(|part| part.as_slice()), case_insensitive);
     let automaton = build_literal_automaton(literals, case_insensitive)?;
     Some(RegexFastPath::LiteralAlternates {
         automaton,
         max_literal_len,
+        reject_fast,
     })
 }
 
@@ -596,6 +752,121 @@ fn set_ascii_casefold_shift(shift: &mut [usize; 256], folded_byte: u8, distance:
     let upper = folded_byte.to_ascii_uppercase();
     shift[lower as usize] = distance;
     shift[upper as usize] = distance;
+}
+
+fn best_literal_anchor_plan(needle: &[u8]) -> Option<LiteralAnchorPlan> {
+    if needle.len() < LITERAL_ANCHOR_MIN_LEN {
+        return None;
+    }
+
+    let mut counts = [0u8; 256];
+    let mut distinct = 0usize;
+    for &byte in needle {
+        let slot = &mut counts[byte as usize];
+        if *slot == 0 {
+            distinct += 1;
+        }
+        *slot = slot.saturating_add(1);
+    }
+    if distinct < LITERAL_ANCHOR_MIN_DISTINCT_BYTES {
+        return None;
+    }
+
+    let center = needle.len() / 2;
+    let (_, plan) = needle
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(offset, byte)| {
+            let duplicate_penalty = counts[byte as usize].saturating_sub(1) as u16;
+            let rank = ascii_anchor_frequency_rank(byte) as u16;
+            let poison_penalty = if is_poisonous_anchor_byte(byte) { 1u16 } else { 0u16 };
+            let edge_penalty = if offset == 0 || offset + 1 == needle.len() {
+                1u16
+            } else {
+                0u16
+            };
+            let adjacent_duplicate_penalty = if (offset > 0 && needle[offset - 1] == byte)
+                || (offset + 1 < needle.len() && needle[offset + 1] == byte)
+            {
+                1u16
+            } else {
+                0u16
+            };
+            let center_distance = offset.abs_diff(center) as u16;
+            (
+                (
+                    poison_penalty,
+                    duplicate_penalty,
+                    adjacent_duplicate_penalty,
+                    rank,
+                    edge_penalty,
+                    center_distance,
+                    offset,
+                ),
+                LiteralAnchorPlan { offset, byte },
+            )
+        })
+        .min_by_key(|(key, _)| *key)?;
+
+    let anchor_count = counts[plan.byte as usize] as u16;
+    let anchor_rank = ascii_anchor_frequency_rank(plan.byte) as u16;
+    if is_poisonous_anchor_byte(plan.byte) {
+        return None;
+    }
+    if anchor_count > 1 && anchor_rank > LITERAL_ANCHOR_STRONG_RANK_MAX {
+        return None;
+    }
+    Some(plan)
+}
+
+fn ascii_anchor_frequency_rank(byte: u8) -> u8 {
+    if byte.is_ascii_whitespace() {
+        return 255;
+    }
+    if byte == b'_' {
+        return 245;
+    }
+    if byte.is_ascii_digit() {
+        return 232;
+    }
+    if !byte.is_ascii_alphanumeric() {
+        return 120;
+    }
+
+    match byte.to_ascii_lowercase() {
+        b'z' => 4,
+        b'q' => 8,
+        b'j' => 12,
+        b'x' => 16,
+        b'k' => 20,
+        b'v' => 28,
+        b'b' => 36,
+        b'p' => 44,
+        b'g' => 52,
+        b'w' => 60,
+        b'y' => 68,
+        b'f' => 76,
+        b'm' => 84,
+        b'c' => 92,
+        b'u' => 100,
+        b'l' => 108,
+        b'd' => 116,
+        b'r' => 124,
+        b'h' => 132,
+        b's' => 140,
+        b'n' => 148,
+        b'i' => 156,
+        b'o' => 164,
+        b'a' => 172,
+        b't' => 180,
+        b'e' => 188,
+        _ => 200,
+    }
+}
+
+fn is_poisonous_anchor_byte(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || byte == b'_' || byte == b'\0'
 }
 
 fn build_literal_automaton(literals: Vec<Vec<u8>>, case_insensitive: bool) -> Option<AhoCorasick> {
@@ -860,6 +1131,28 @@ mod tests {
         }
     }
 
+    fn reject_fast_enabled(plan: &ExpressionPlan) -> bool {
+        match regex_fast_path(plan) {
+            Some(RegexFastPath::PlainLiteral { reject_fast, .. }) => reject_fast.is_some(),
+            Some(RegexFastPath::AsciiCaseFoldLiteral { reject_fast, .. }) => {
+                reject_fast.is_some()
+            }
+            Some(RegexFastPath::LiteralAlternates { reject_fast, .. }) => reject_fast.is_some(),
+            _ => false,
+        }
+    }
+
+    fn reject_fast_gate(plan: &ExpressionPlan) -> Option<&super::RejectFastGate> {
+        match regex_fast_path(plan) {
+            Some(RegexFastPath::PlainLiteral { reject_fast, .. }) => reject_fast.as_ref(),
+            Some(RegexFastPath::AsciiCaseFoldLiteral { reject_fast, .. }) => {
+                reject_fast.as_ref()
+            }
+            Some(RegexFastPath::LiteralAlternates { reject_fast, .. }) => reject_fast.as_ref(),
+            _ => None,
+        }
+    }
+
     #[test]
     fn word_boundary_fast_path_counts_only_real_boundaries() {
         let plan = ExpressionPlan::parse(r"re:\bPM_RESUME\b").expect("plan should parse");
@@ -908,6 +1201,49 @@ mod tests {
             regex_fast_path(&plan),
             Some(RegexFastPath::AsciiCaseFoldLiteral { .. })
         ));
+        assert!(reject_fast_enabled(&plan));
+    }
+
+    #[test]
+    fn casefold_searcher_anchor_plan_prefers_informative_interior_byte() {
+        let searcher =
+            super::AsciiCaseFoldSearcher::new(b"Sherlock Holmes").expect("searcher should build");
+        assert_eq!(
+            searcher.anchor,
+            Some(super::LiteralAnchorPlan {
+                offset: 7,
+                byte: b'k',
+            })
+        );
+    }
+
+    #[test]
+    fn casefold_searcher_anchor_plan_is_deterministic() {
+        let first =
+            super::AsciiCaseFoldSearcher::new(b"Sherlock Holmes").expect("searcher should build");
+        let second =
+            super::AsciiCaseFoldSearcher::new(b"Sherlock Holmes").expect("searcher should build");
+        assert_eq!(first.anchor, second.anchor);
+    }
+
+    #[test]
+    fn casefold_searcher_anchor_plan_stays_disabled_for_short_literals() {
+        let searcher = super::AsciiCaseFoldSearcher::new(b"abc").expect("searcher should build");
+        assert_eq!(searcher.anchor, None);
+    }
+
+    #[test]
+    fn casefold_searcher_anchor_plan_stays_disabled_for_low_information_needles() {
+        let searcher = super::AsciiCaseFoldSearcher::new(b"AAAAAA").expect("searcher should build");
+        assert_eq!(searcher.anchor, None);
+    }
+
+    #[test]
+    fn casefold_searcher_anchor_path_skips_false_positive_anchor_hits() {
+        let searcher =
+            super::AsciiCaseFoldSearcher::new(b"Sherlock Holmes").expect("searcher should build");
+        let haystack = b"XXXXXXXkzzzzSherlock Holmes";
+        assert_eq!(searcher.find(haystack, 0), Some(12));
     }
 
     #[test]
@@ -930,6 +1266,42 @@ mod tests {
     fn case_insensitive_fast_path_does_not_activate_for_non_ascii_literals() {
         let plan = ExpressionPlan::parse(r"re:(?i)Straße").expect("plan should parse");
         assert!(regex_fast_path(&plan).is_none());
+    }
+
+    #[test]
+    fn reject_fast_does_not_activate_for_short_literals() {
+        let plan = ExpressionPlan::parse(r"re:(?i)short").expect("plan should parse");
+        assert!(!reject_fast_enabled(&plan));
+    }
+
+    #[test]
+    fn alternates_fast_path_enables_reject_fast_for_long_ascii_literals() {
+        let plan =
+            ExpressionPlan::parse(r"re:(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)")
+                .expect("plan should parse");
+        assert!(matches!(
+            regex_fast_path(&plan),
+            Some(RegexFastPath::LiteralAlternates { .. })
+        ));
+        assert!(reject_fast_enabled(&plan));
+    }
+
+    #[test]
+    fn reject_fast_gate_accepts_real_casefold_prefix_window() {
+        let plan = ExpressionPlan::parse(r"re:(?i)Sherlock Holmes").expect("plan should parse");
+        let haystack = b"prefix SHERLOCK HOLMES suffix";
+        let gate = reject_fast_gate(&plan).expect("reject-fast gate should exist");
+        assert!(gate.could_match_anywhere(haystack));
+    }
+
+    #[test]
+    fn reject_fast_gate_rejects_non_matching_alternates_text() {
+        let plan = ExpressionPlan::parse(r"re:(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)")
+            .expect("plan should parse");
+        let gate = reject_fast_gate(&plan).expect("reject-fast gate should exist");
+        let haystack = b"kernel warnings without tracked prefixes";
+        assert!(!gate.could_match_anywhere(haystack));
+        assert!(!gate.could_match_with_start_in_range(haystack, 0, haystack.len()));
     }
 
     #[test]
