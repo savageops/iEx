@@ -8,6 +8,7 @@
     "test": "vitest run --config vitest.config.ts",
     "test:watch": "vitest --config vitest.config.ts",
     "bench:once": "node tools/scripts/run-once-benchmark.mjs",
+    "bench:report": "node tools/scripts/bench-report.mjs",
     "bench:loop": "node tools/scripts/bench-loop.mjs",
     "dashboard": "node tools/scripts/dashboard-server.mjs",
     "materialize:tests": "node tools/scripts/materialize-tests.mjs"

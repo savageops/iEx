@@ -6,5 +6,7 @@
 .DS_Store
 Thumbs.db
 /.docs
-AGENTS.md
 /.refs
+/tests
+/todo
+/tools
