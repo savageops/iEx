@@ -26,22 +26,31 @@ npm run dashboard
 
 ## Benchmark telemetry
 
-- One-shot run: `node tools/scripts/run-once-benchmark.mjs --build-profile release --warmup 1`
-- Range report run: `node tools/scripts/bench-report.mjs --reps 5 --build-profile release --warmup 1 --samples 1`
-- Loop runner: `node tools/scripts/bench-loop.mjs --loops 1 --build-profile release --warmup 1`
-- Live dashboard: `node tools/scripts/dashboard-server.mjs`
+- Canonical benchmark suite (ripgrep benchsuite):
+  - list suite cases: `npm run bench:suite:list`
+  - download suite corpora (default `subtitles-en`): `npm run bench:suite:download`
+  - download specific corpus set: `npm run bench:suite:download -- subtitles-en subtitles-ru`
+  - Windows-safe full data bootstrap (subtitles + linux fallback path): `npm run bench:suite:bootstrap-data`
+  - run suite: `npm run bench:report`
+- iEx diagnostic harness (non-canonical, for local hotspot triage):
+  - one-shot run: `node tools/scripts/run-once-benchmark.mjs --build-profile release --warmup 1`
+  - range report run: `npm run bench:report:diag -- --reps 5 --build-profile release --warmup 1 --samples 1`
+  - loop runner (suite-profile stream): `npm run bench:loop -- --loops 1 --build-profile release --warmup 1`
+  - legacy synthetic loop runner: `npm run bench:loop:diag -- --loops 1 --build-profile release --warmup 1`
+  - live dashboard: `node tools/scripts/dashboard-server.mjs`
 - Reports:
   - `tools/reports/live-metrics.jsonl` (append-only history)
   - `tools/reports/latest.json` (latest snapshot)
   - `tools/reports/bench/v2-vs-rg-*.json` (full range report artifact)
   - `tools/reports/bench/latest.json` (latest range report)
+  - `tools/reports/bench/ripgrep-benchsuite-*.csv` (canonical ripgrep benchsuite raw data)
   - `.docs/bench/metrics-index.md` (human-readable metric interpretation guide)
-- Competitor commands are configured in `tools/scripts/competitors.json`.
+- Canonical performance measurement is ripgrep suite output; diagnostic harness remains available for instrumentation and tuning.
 - Metric model:
   - `iexMs`: iEx core engine time (`report.stats.timings.total_ms`)
   - `iexCliMs`: full CLI wall-clock time (startup + parse + engine + output)
   - `iexProcessOverheadMs`: `iexCliMs - iexMs`
-  - `rgMs`: competitor CLI wall-clock time
+  - `rgMs`: ripgrep CLI wall-clock time
   - `iexToRgRatio`: `iexMs / rgMs` (above 1.0x means iEx slower, below 1.0x means iEx faster)
   - Range report includes min/median/p95/max by profile and phase slowdown attribution.
 
@@ -53,6 +62,6 @@ npm run dashboard
 
 ## Performance goal
 
-The target is to iteratively optimize iEx until it beats ripgrep and other top search competitors (including fff and codedb where applicable) with a tracked goal of >= 50% faster than ripgrep on agreed benchmark suites.
+The target is to iteratively optimize iEx until it beats ripgrep with a tracked goal of >= 50% faster than ripgrep on agreed benchmark suites.
 
 Current benchmark truth must always come from the latest generated report artifact in `tools/reports/bench/` and live dashboard summary instead of static README claims.

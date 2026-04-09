@@ -2,11 +2,12 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    sync::mpsc,
     time::Instant,
 };
 
 use anyhow::{Context, Result};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use memchr::memchr;
 use memmap2::MmapOptions;
 use rayon::prelude::*;
@@ -15,6 +16,7 @@ use serde::Serialize;
 use crate::{expr::ExpressionPlan, stats::SearchStats};
 
 const SMALL_FILE_INLINE_LIMIT: u64 = 256 * 1024;
+const BINARY_SNIFF_LIMIT: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
@@ -151,16 +153,21 @@ fn discover_files(config: &SearchConfig) -> Result<Vec<PathBuf>> {
         .ignore(true)
         .parents(true);
 
-    let mut files = Vec::new();
-    for result in builder.build() {
-        let entry = match result {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        if entry.file_type().is_some_and(|kind| kind.is_file()) {
-            files.push(entry.into_path());
-        }
-    }
+    let (sender, receiver) = mpsc::channel::<PathBuf>();
+    let walker = builder.build_parallel();
+    walker.run(|| {
+        let sender = sender.clone();
+        Box::new(move |result| {
+            if let Ok(entry) = result {
+                if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    let _ = sender.send(entry.into_path());
+                }
+            }
+            WalkState::Continue
+        })
+    });
+    drop(sender);
+    let files: Vec<PathBuf> = receiver.into_iter().collect();
 
     Ok(files)
 }
@@ -174,9 +181,11 @@ fn auto_threads_for_files(file_count: usize) -> usize {
     } else if file_count <= 256 {
         4
     } else if file_count <= 1_024 {
-        6
-    } else {
         8
+    } else if file_count <= 8_192 {
+        12
+    } else {
+        16
     };
     available.min(file_tier).max(1)
 }
@@ -217,7 +226,7 @@ fn scan_loaded_bytes(
     file_bytes: u64,
     started: Instant,
 ) -> FileScanOutcome {
-    if bytes.contains(&0) {
+    if is_likely_binary(bytes) {
         return failed_outcome(path, started, file_bytes);
     }
 
@@ -303,6 +312,11 @@ fn scan_loaded_bytes(
     completed_outcome(path, started, file_bytes, hits, match_count)
 }
 
+fn is_likely_binary(bytes: &[u8]) -> bool {
+    let sniff_len = bytes.len().min(BINARY_SNIFF_LIMIT);
+    bytes[..sniff_len].contains(&0)
+}
+
 fn completed_outcome(
     path: &Path,
     started: Instant,
@@ -328,5 +342,20 @@ fn failed_outcome(path: &Path, started: Instant, bytes: u64) -> FileScanOutcome 
         hits: Vec::new(),
         match_count: 0,
         scanned: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_threads_for_files;
+
+    #[test]
+    fn auto_threads_scales_monotonically_with_file_count() {
+        let tiny = auto_threads_for_files(16);
+        let medium = auto_threads_for_files(1_000);
+        let huge = auto_threads_for_files(100_000);
+        assert!(tiny >= 1);
+        assert!(medium >= tiny);
+        assert!(huge >= medium);
     }
 }
