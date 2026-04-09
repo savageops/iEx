@@ -335,8 +335,10 @@
             <tr>
               <th>Timestamp</th>
               <th>Profile</th>
-              <th>Ratio</th>
-              <th>Speedup %</th>
+              <th>iEx/rg</th>
+              <th>vs rg %</th>
+              <th>iEx/ugrep</th>
+              <th>vs ugrep %</th>
               <th>iEx ms</th>
               <th>rg ms</th>
               <th>ugrep ms</th>
@@ -949,16 +951,23 @@
             const rg = asNum(run.rgMs, 0);
             const iex = asNum(run.iexMs, 0);
             const ugrep = asNum(run?.competitors?.ugrep?.durationMs, 0);
+            const ugrepAvailable = run?.competitors?.ugrep?.available && ugrep > 0;
             const ugrepText =
-              run?.competitors?.ugrep?.available && ugrep > 0
+              ugrepAvailable
                 ? fmt(ugrep)
                 : "n/a";
-            const ratio = asNum(run.iexToRgRatio, rg > 0 ? iex / rg : 0);
+            const rgRatio = asNum(run.iexToRgRatio, rg > 0 ? iex / rg : 0);
+            const ugrepRatio = ugrepAvailable ? asNum(iex / ugrep, 0) : 0;
+            const ugrepSpeedup = ugrepAvailable
+              ? ((ugrep - iex) / ugrep) * 100
+              : null;
             return `<tr>
               <td>${new Date(run.timestamp).toLocaleString()}</td>
               <td>${run.profile}</td>
-              <td class="${ratioClass(ratio)}">${fmt(ratio, 3)}x</td>
+              <td class="${ratioClass(rgRatio)}">${fmt(rgRatio, 3)}x</td>
               <td>${fmt(run.speedupPct)}%</td>
+              <td class="${ugrepAvailable ? ratioClass(ugrepRatio) : "muted"}">${ugrepAvailable ? `${fmt(ugrepRatio, 3)}x` : "n/a"}</td>
+              <td>${ugrepAvailable ? `${fmt(ugrepSpeedup)}%` : "n/a"}</td>
               <td>${fmt(iex)}</td>
               <td>${fmt(rg)}</td>
               <td>${ugrepText}</td>

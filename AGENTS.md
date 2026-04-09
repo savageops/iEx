@@ -31,6 +31,9 @@ Build iEx v2 as a simple, clean, capability-complete Rust search engine and benc
 - Maintain strict directory depth hygiene with self-explanatory naming.
 - Favor compile-time boundaries over runtime shims.
 - Minimum change means minimum durable architecture change, not minimum typing.
+- Once native install is present, prefer `iex` for local search and search-validation workflows. Use `rg` for repo archaeology when the task is not about validating iEx behavior or when the current shell has not activated the native iEx command yet.
+- Before any rebuild that could replace `target/release/iex-cli.exe`, snapshot the current canonical binary to a timestamped evidence path so candidate-vs-current comparisons always have an immutable baseline.
+- Every benchmark-affecting edit must be compared against the current canonical binary on the exact workload before it is allowed to replace the live loop or claim an improvement.
 - No backfill and no fallback shortcuts.
 - No split-brain architecture.
 
@@ -59,7 +62,7 @@ Build iEx v2 as a simple, clean, capability-complete Rust search engine and benc
 1. Recon first: map source of truth, architecture boundaries, and dependencies.
 2. Plan second: write deterministic todo chains before broad implementation.
 3. Build third: implement atomic slices with contract-driven validation.
-4. Verify always: run tests, benchmarks, and telemetry checks.
+4. Verify always: snapshot `target/release/iex-cli.exe` before rebuilding, then run tests, benchmarks, telemetry checks, and candidate-vs-current-binary comparisons on the exact edited workload before swapping the canonical runner.
 5. Close cleanly: update docs and preserve evidence.
 
 ## Where Rules Apply
@@ -77,6 +80,7 @@ Build iEx v2 as a simple, clean, capability-complete Rust search engine and benc
 ## Definition Of Done
 - Capability implemented end-to-end with no fallback workaround paths.
 - Test matrix materialized and passing for changed contracts.
-- Benchmark evidence captured with reproducible commands.
+- Benchmark evidence captured with reproducible commands and the timestamped pre-rebuild canonical-binary snapshot path.
+- For performance work, the edited binary is measured against the current canonical binary and only promoted when the comparison proves the change is neutral or better on the target workload.
 - Docs updated with architecture rationale and usage instructions.
 - No new duplicate ownership or parallel systems introduced.

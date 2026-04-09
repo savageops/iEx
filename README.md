@@ -2,6 +2,9 @@
 
 iEx (`intelligent expressions`) is a Rust-first search framework designed to evolve beyond linear regex workflows.
 
+Canonical repo: [github.com/savageops/iEx](https://github.com/savageops/iEx)  
+Canonical site: [iex.run](https://iex.run)
+
 ## Layout
 
 - `crates/iex-core`: expression planner + high-throughput scanner
@@ -31,6 +34,63 @@ npm run bench:loop
 npm run dashboard
 ```
 
+## Native install
+
+Install iEx as a native shell command so operators and agents use the same system-visible binary.
+
+Windows:
+
+```powershell
+npm run install:native:windows
+```
+
+Cross-platform dispatcher:
+
+```powershell
+npm run install:native
+```
+
+Windows installer contract:
+- builds `target/release/iex-cli.exe` when needed
+- snapshots the current release binary before any rebuild that would replace it
+- installs the native command to `%LOCALAPPDATA%\Programs\iEx\bin\iex.exe`
+- adds that directory to the user `PATH`
+- writes a PowerShell profile block that removes the built-in `iex` alias (`Invoke-Expression`) and remaps `iex` to the installed iEx binary
+
+macOS / Linux:
+
+```bash
+npm run install:native:unix
+```
+
+Cross-platform dispatcher:
+
+```bash
+npm run install:native
+```
+
+Unix installer contract:
+- builds `target/release/iex-cli` when needed
+- snapshots the current release binary before any rebuild that would replace it
+- installs the native command to `~/.local/bin/iex`
+- appends `~/.local/bin` PATH export blocks to the common shell profiles when missing
+
+Friend-safe macOS binary from CI:
+- run the GitHub Actions workflow in [build-native-binaries.yml](/E:/Workspaces/01_Projects/01_Github/iEx-Engine-v2/.github/workflows/build-native-binaries.yml)
+- download `iex-macos-x64` for Intel Macs or `iex-macos-arm64` for Apple Silicon Macs
+- unpack the archive and then run `bash tools/scripts/install-native.sh --source-binary /path/to/iex`
+
+Verification:
+
+```powershell
+iex --help
+iex search "lit:Sherlock Holmes" . --stats-only
+```
+
+PowerShell note: `iex` normally resolves to `Invoke-Expression`. The Windows installer takes ownership of the `iex` command name in the current user's PowerShell profile so new sessions resolve to the native iEx binary. `iex.exe` remains directly callable at any time.
+
+Cross-build note: a macOS binary cannot be linked from this Windows machine by Rust target installation alone. It still needs a real macOS runner or Apple SDK/toolchain. The workflow exists to keep that build canonical and reproducible.
+
 ## Benchmark telemetry
 
 - Canonical benchmark suite (ripgrep benchsuite):
@@ -46,6 +106,7 @@ npm run dashboard
   - archive the current live loop and clear it for a fresh run while preserving self-improvement baseline knowledge: `npm run bench:reset`
   - loop runner (suite-profile stream): `npm run bench:loop -- --loops 1 --build-profile release --warmup 1`
   - legacy synthetic loop runner: `npm run bench:loop:diag -- --loops 1 --build-profile release --warmup 1`
+  - pinned-binary replay without rebuild: `npm run bench:loop -- --loops 1 --iex-binary tools/reports/candidate-compare/iex-cli-baseline-YYYYMMDD-HHMMSS.exe`
   - live dashboard: `node tools/scripts/dashboard-server.mjs`
   - optional external contenders are configured in `tools/scripts/competitors.json`; `ripgrep` is the baseline and `ugrep` is the current best-contender lane when available locally
 - Reports:
@@ -60,6 +121,7 @@ npm run dashboard
   - `.docs/bench/metrics-index.md` (human-readable metric interpretation guide)
 - Dashboard provenance: the live monitor summarizes `tools/reports/live-metrics.jsonl` and separately surfaces the latest `ripgrep-benchsuite-*.csv` artifact so benchsuite refresh status stays visible beside the live diagnostics feed.
 - Canonical performance measurement is the ripgrep benchsuite raw artifact plus the live iEx diagnostics window; the live diagnostics harness remains available for instrumentation and tuning.
+- Benchmark scripts accept `--iex-binary <path>` for explicit baseline/candidate replays; when supplied, the runner uses that immutable binary path instead of rebuilding `target/release/iex-cli.exe`.
 - Metric model:
   - `iexMs`: iEx core engine time (`report.stats.timings.total_ms`)
   - `iexCliMs`: full CLI wall-clock time (startup + parse + engine + output)
@@ -81,3 +143,7 @@ npm run dashboard
 The target is to iteratively optimize iEx until it beats ripgrep with a tracked goal of >= 50% faster than ripgrep on agreed benchmark suites.
 
 Current benchmark truth must always come from the latest generated report artifact in `tools/reports/bench/` and live dashboard summary instead of static README claims.
+
+## Agent and operator usage rule
+
+Once native install is present, prefer `iex` for local search, search validation, and operator workflows in this repo. Use `rg` for repo archaeology when the task is not validating iEx behavior itself or when the native install has not been activated in the current shell yet.

@@ -1,0 +1,78 @@
+name: build-native-binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+            artifact_name: iex-windows-x64
+            binary_path: target/release/iex-cli.exe
+            packaged_binary_name: iex.exe
+            archive_ext: zip
+          - os: ubuntu-latest
+            label: linux-x64
+            artifact_name: iex-linux-x64
+            binary_path: target/release/iex-cli
+            packaged_binary_name: iex
+            archive_ext: tar.gz
+          - os: macos-13
+            label: macos-x64
+            artifact_name: iex-macos-x64
+            binary_path: target/release/iex-cli
+            packaged_binary_name: iex
+            archive_ext: tar.gz
+          - os: macos-14
+            label: macos-arm64
+            artifact_name: iex-macos-arm64
+            binary_path: target/release/iex-cli
+            packaged_binary_name: iex
+            archive_ext: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release -p iex-cli
+
+      - name: Stage packaged binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "${{ matrix.binary_path }}" "dist/${{ matrix.packaged_binary_name }}"
+          if [[ "${{ matrix.os }}" != windows-* ]]; then
+            chmod +x "dist/${{ matrix.packaged_binary_name }}"
+          fi
+
+      - name: Archive package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
+            7z a "../${{ matrix.artifact_name }}.zip" "${{ matrix.packaged_binary_name }}"
+          else
+            tar -czf "../${{ matrix.artifact_name }}.tar.gz" "${{ matrix.packaged_binary_name }}"
+          fi
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
+

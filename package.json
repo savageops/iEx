@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "fixtures": "node tools/scripts/generate-fixtures.mjs",
+    "install:native": "node tools/scripts/install-native.mjs",
+    "install:native:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/scripts/install-native.ps1",
+    "install:native:unix": "bash tools/scripts/install-native.sh",
     "test": "vitest run --config vitest.config.ts",
     "test:watch": "vitest --config vitest.config.ts",
     "bench:once": "node tools/scripts/run-once-benchmark.mjs",

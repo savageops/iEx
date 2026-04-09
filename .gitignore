@@ -10,3 +10,7 @@ Thumbs.db
 /todo
 /tools
 ugrep.exe
+/target-bench-temp
+/target-candidate-compare
+/.untrack
+/.refs
