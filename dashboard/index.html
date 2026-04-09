@@ -127,6 +127,64 @@
         font-size: 11px;
         font-weight: 600;
       }
+      .section-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .segmented-control {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .segmented-control button {
+        appearance: none;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        background: rgba(0, 0, 0, 0.22);
+        color: var(--muted);
+        border-radius: 999px;
+        padding: 6px 10px;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .segmented-control button.is-active {
+        color: var(--text);
+        border-color: rgba(110, 199, 255, 0.6);
+        background: rgba(110, 199, 255, 0.16);
+        box-shadow: inset 0 0 0 1px rgba(110, 199, 255, 0.18);
+      }
+      .trend-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin: 10px 0 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .trend-legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+      .trend-legend-swatch {
+        width: 22px;
+        height: 0;
+        border-top: 3px solid currentColor;
+        border-radius: 999px;
+      }
+      .trend-meta {
+        margin: 0 0 8px;
+        font-size: 12px;
+      }
+      @media (max-width: 720px) {
+        .section-bar {
+          align-items: flex-start;
+        }
+      }
     </style>
   </head>
   <body>
@@ -134,11 +192,16 @@
       <section class="card">
         <h1>iEx Benchmark Monitor</h1>
         <p class="muted">Median and p95 ranges, slowdown phase attribution, and live run diagnostics.</p>
-        <p class="muted">Canonical measurement source: ripgrep benchsuite via <code>npm run bench:report</code>.</p>
+        <p class="muted">This page summarizes the live diagnostics feed from <code>npm run bench:loop</code> and surfaces the latest raw ripgrep benchsuite artifact from <code>npm run bench:report</code> for provenance.</p>
+        <p class="muted">Canonical raw baseline: <code>bench:report</code>. Live monitor feed: <code>bench:loop</code> into <code>tools/reports/live-metrics.jsonl</code>.</p>
         <div class="status-line">
           <div>Connection: <span id="connection-state" class="warn">connecting</span></div>
           <div>Data window: <span id="window-state">n/a</span></div>
           <div>Latest run: <span id="latest-state">n/a</span></div>
+        </div>
+        <div class="status-line">
+          <div>Live summary source: <span id="live-source-state">n/a</span></div>
+          <div>Latest benchsuite raw: <span id="benchsuite-source-state">n/a</span></div>
         </div>
       </section>
 
@@ -206,9 +269,24 @@
       </section>
 
       <section class="card">
-        <h2>Ratio Trend (iEx/rg)</h2>
+        <div class="section-bar">
+          <h2>Ratio Trend (iEx/rg + iEx/ugrep)</h2>
+          <div class="segmented-control" id="trend-window-controls" role="group" aria-label="Ratio trend window">
+            <button type="button" data-trend-window="1h" aria-pressed="false">1h</button>
+            <button type="button" data-trend-window="12h" aria-pressed="true" class="is-active">12h</button>
+            <button type="button" data-trend-window="1d" aria-pressed="false">1 day</button>
+            <button type="button" data-trend-window="7d" aria-pressed="false">7 days</button>
+            <button type="button" data-trend-window="all" aria-pressed="false">All time</button>
+          </div>
+        </div>
+        <div class="trend-legend" aria-hidden="true">
+          <span class="trend-legend-item" style="color:#6ec7ff"><span class="trend-legend-swatch"></span>iEx/rg</span>
+          <span class="trend-legend-item" style="color:#2dd28c"><span class="trend-legend-swatch"></span>iEx/ugrep</span>
+          <span class="trend-legend-item" style="color:#f3b04a"><span class="trend-legend-swatch"></span>1.0x parity</span>
+        </div>
+        <p class="muted trend-meta" id="trend-meta">n/a</p>
         <canvas id="ratio-trend" width="1280" height="320"></canvas>
-        <p class="muted">1.0x baseline means parity. Above 1.0x means iEx is slower. Below 1.0x means iEx is faster.</p>
+        <p class="muted">1.0x baseline means parity. Above 1.0x means iEx is slower. Below 1.0x means iEx is faster. The green line only renders where `ugrep` timings exist in the selected window.</p>
       </section>
 
       <section class="grid-2">
@@ -334,6 +412,9 @@
       const connState = document.getElementById("connection-state");
       const windowState = document.getElementById("window-state");
       const latestState = document.getElementById("latest-state");
+      const liveSourceState = document.getElementById("live-source-state");
+      const benchsuiteSourceState = document.getElementById("benchsuite-source-state");
+      const trendMeta = document.getElementById("trend-meta");
       const compareEmpty = document.getElementById("compare-empty");
       const signalTable = document.getElementById("signal-table");
       const signalEmpty = document.getElementById("signal-empty");
@@ -346,10 +427,20 @@
       const hintEmpty = document.getElementById("hint-empty");
       const indexEmpty = document.getElementById("index-empty");
       const slowEmpty = document.getElementById("slow-empty");
+      const trendWindowButtons = Array.from(document.querySelectorAll("[data-trend-window]"));
 
       const history = [];
       const seenRunIds = new Set();
       let summary = null;
+      let sources = null;
+      let selectedTrendWindow = "12h";
+      const trendWindows = {
+        "1h": { label: "1h", ms: 60 * 60 * 1000 },
+        "12h": { label: "12h", ms: 12 * 60 * 60 * 1000 },
+        "1d": { label: "1 day", ms: 24 * 60 * 60 * 1000 },
+        "7d": { label: "7 days", ms: 7 * 24 * 60 * 60 * 1000 },
+        all: { label: "all time", ms: null },
+      };
 
       function asNum(value, fallback = 0) {
         const parsed = Number(value);
@@ -384,6 +475,20 @@
       function connectionLabel(connected) {
         connState.textContent = connected ? "connected" : "disconnected";
         connState.className = connected ? "good" : "bad";
+      }
+
+      function sourceLabel(source) {
+        if (!source) {
+          return "n/a";
+        }
+        const path = source.artifactPath || "missing";
+        if (!source.available) {
+          return `${source.command} -> ${path}`;
+        }
+        const updatedAt = source.updatedAt
+          ? ` (${new Date(source.updatedAt).toLocaleString()})`
+          : "";
+        return `${source.command} -> ${path}${updatedAt}`;
       }
 
       function ingestRuns(runs) {
@@ -457,6 +562,62 @@
         return "severity-info";
       }
 
+      function timestampMs(value) {
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+
+      function trendWindowConfig() {
+        return trendWindows[selectedTrendWindow] || trendWindows["12h"];
+      }
+
+      function filteredTrendRuns() {
+        if (!history.length) {
+          return [];
+        }
+        const windowConfig = trendWindowConfig();
+        if (!windowConfig.ms) {
+          return history.slice();
+        }
+        const latestTimestamp = timestampMs(history[history.length - 1]?.timestamp) ?? Date.now();
+        const cutoff = latestTimestamp - windowConfig.ms;
+        return history.filter((run) => {
+          const runTimestamp = timestampMs(run?.timestamp);
+          return runTimestamp !== null && runTimestamp >= cutoff;
+        });
+      }
+
+      function trendRatioFor(run, lane) {
+        const iex = asNum(run?.iexMs, 0);
+        if (iex <= 0) {
+          return null;
+        }
+        if (lane === "rg") {
+          const rg = asNum(run?.rgMs, 0);
+          if (rg <= 0) {
+            return null;
+          }
+          return asNum(run?.iexToRgRatio, iex / rg);
+        }
+        if (lane === "ugrep") {
+          const competitor = run?.competitors?.ugrep;
+          const ugrep = asNum(competitor?.durationMs, 0);
+          if (!competitor?.available || ugrep <= 0) {
+            return null;
+          }
+          return iex / ugrep;
+        }
+        return null;
+      }
+
+      function updateTrendWindowButtons() {
+        trendWindowButtons.forEach((button) => {
+          const isActive = button.dataset.trendWindow === selectedTrendWindow;
+          button.classList.toggle("is-active", isActive);
+          button.setAttribute("aria-pressed", isActive ? "true" : "false");
+        });
+      }
+
       function signalStatusClass(status) {
         if (status === "good") return "good";
         if (status === "warn") return "warn";
@@ -486,6 +647,8 @@
         } else {
           latestState.textContent = "n/a";
         }
+        liveSourceState.textContent = sourceLabel(sources?.liveDiagnostics);
+        benchsuiteSourceState.textContent = sourceLabel(sources?.benchsuiteRaw);
       }
 
       function renderMetrics() {
@@ -655,34 +818,39 @@
 
       function drawRatioTrend() {
         ratioCtx.clearRect(0, 0, ratioCanvas.width, ratioCanvas.height);
-        const recent = history.slice(-120);
-        if (!recent.length) {
+        updateTrendWindowButtons();
+        const runs = filteredTrendRuns();
+        if (!runs.length) {
+          trendMeta.textContent = `No runs in the ${trendWindowConfig().label} window yet.`;
           return;
         }
 
-        const ratios = recent.map((run) => {
-          const ratio = asNum(run.iexToRgRatio, 0);
-          if (ratio > 0) return ratio;
-          const rg = asNum(run.rgMs, 0);
-          const iex = asNum(run.iexMs, 0);
-          return rg > 0 ? iex / rg : 0;
-        }).filter((value) => value > 0);
+        const rgRatios = runs.map((run) => trendRatioFor(run, "rg"));
+        const ugrepRatios = runs.map((run) => trendRatioFor(run, "ugrep"));
+        const ratios = [...rgRatios, ...ugrepRatios].filter((value) => Number.isFinite(value) && value > 0);
         if (!ratios.length) {
+          trendMeta.textContent = `No comparable ratio data is available in the ${trendWindowConfig().label} window.`;
           return;
         }
 
         const pad = 34;
         const w = ratioCanvas.width - pad * 2;
         const h = ratioCanvas.height - pad * 2;
-        const minY = Math.min(0.75, Math.min(...ratios));
-        const maxY = Math.max(1.25, Math.max(...ratios));
+        const minCandidate = Math.min(...ratios, 1);
+        const maxCandidate = Math.max(...ratios, 1);
+        const minY = Math.min(0.75, minCandidate);
+        const maxY = Math.max(1.25, maxCandidate);
+        const startLabel = runs[0]?.timestamp ? new Date(runs[0].timestamp).toLocaleString() : "n/a";
+        const endLabel = runs[runs.length - 1]?.timestamp ? new Date(runs[runs.length - 1].timestamp).toLocaleString() : "n/a";
+        const ugrepCoverage = ugrepRatios.filter((value) => Number.isFinite(value) && value > 0).length;
+        trendMeta.textContent = `Showing ${trendWindowConfig().label} • ${runs.length} runs • ${startLabel} -> ${endLabel} • ugrep coverage ${ugrepCoverage}/${runs.length}`;
 
         function yFor(value) {
           return pad + h - ((value - minY) / (maxY - minY || 1)) * h;
         }
 
         function xFor(index) {
-          return pad + (index / Math.max(1, recent.length - 1)) * w;
+          return pad + (index / Math.max(1, runs.length - 1)) * w;
         }
 
         ratioCtx.strokeStyle = "#29436f";
@@ -703,19 +871,36 @@
         ratioCtx.lineTo(pad + w, baselineY);
         ratioCtx.stroke();
 
-        ratioCtx.strokeStyle = "#6ec7ff";
-        ratioCtx.lineWidth = 2.2;
-        ratioCtx.beginPath();
-        recent.forEach((run, index) => {
-          const rg = asNum(run.rgMs, 0);
-          const iex = asNum(run.iexMs, 0);
-          const ratio = asNum(run.iexToRgRatio, rg > 0 ? iex / rg : 0);
-          const x = xFor(index);
-          const y = yFor(ratio);
-          if (index === 0) ratioCtx.moveTo(x, y);
-          else ratioCtx.lineTo(x, y);
-        });
-        ratioCtx.stroke();
+        function drawSeries(series, color) {
+          let started = false;
+          ratioCtx.strokeStyle = color;
+          ratioCtx.lineWidth = 2.2;
+          ratioCtx.beginPath();
+          series.forEach((value, index) => {
+            if (!(Number.isFinite(value) && value > 0)) {
+              if (started) {
+                ratioCtx.stroke();
+                ratioCtx.beginPath();
+                started = false;
+              }
+              return;
+            }
+            const x = xFor(index);
+            const y = yFor(value);
+            if (!started) {
+              ratioCtx.moveTo(x, y);
+              started = true;
+            } else {
+              ratioCtx.lineTo(x, y);
+            }
+          });
+          if (started) {
+            ratioCtx.stroke();
+          }
+        }
+
+        drawSeries(rgRatios, "#6ec7ff");
+        drawSeries(ugrepRatios, "#2dd28c");
       }
 
       function renderProfileTable() {
@@ -839,6 +1024,7 @@
         const summaryData = await summaryResp.json();
         ingestRuns(historyData.history || []);
         summary = summaryData.summary || null;
+        sources = summaryData.sources || null;
         renderAll();
       }
 
@@ -857,6 +1043,7 @@
           const payload = JSON.parse(event.data);
           ingestRuns(payload.history || []);
           summary = payload.summary || summary;
+          sources = payload.sources || sources;
           renderAll();
         });
 
@@ -871,12 +1058,19 @@
         stream.addEventListener("summary", (event) => {
           const payload = JSON.parse(event.data);
           summary = payload.summary || summary;
+          sources = payload.sources || sources;
           renderAll();
         });
       }
 
       async function main() {
         connectionLabel(false);
+        trendWindowButtons.forEach((button) => {
+          button.addEventListener("click", () => {
+            selectedTrendWindow = button.dataset.trendWindow || "12h";
+            drawRatioTrend();
+          });
+        });
         try {
           await bootstrapHttp();
         } catch (error) {

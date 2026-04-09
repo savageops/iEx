@@ -13,6 +13,13 @@ iEx (`intelligent expressions`) is a Rust-first search framework designed to evo
 - `.refs/ripgrep`: upstream baseline reference clone
 - `todo/pending`: planning-spec todo chain
 
+## Search Execution Model
+
+- Direct file roots scan as a single target without walking through ignore traversal first.
+- Very large direct-file `--stats-only` workloads can shard safe fast-count byte ranges across cores inside that same single-file ownership path.
+- Directory roots use one discovered file list, then auto-select scan parallelism from corpus size.
+- Benchmark telemetry should reflect this single ownership path; avoid separate hybrid auto walkers or hidden fallback scan modes.
+
 ## Quickstart
 
 ```powershell
@@ -32,21 +39,27 @@ npm run dashboard
   - download specific corpus set: `npm run bench:suite:download -- subtitles-en subtitles-ru`
   - Windows-safe full data bootstrap (subtitles + linux fallback path): `npm run bench:suite:bootstrap-data`
   - run suite: `npm run bench:report`
-- iEx diagnostic harness (non-canonical, for local hotspot triage):
+  - iEx diagnostic harness (non-canonical, for local hotspot triage):
   - one-shot run: `node tools/scripts/run-once-benchmark.mjs --build-profile release --warmup 1`
   - range report run: `npm run bench:report:diag -- --reps 5 --build-profile release --warmup 1 --samples 1`
+  - direct contender rerun on codedb: `npm run bench:contenders:direct -- --reps 25 --warmup 3`
+  - archive the current live loop and clear it for a fresh run while preserving self-improvement baseline knowledge: `npm run bench:reset`
   - loop runner (suite-profile stream): `npm run bench:loop -- --loops 1 --build-profile release --warmup 1`
   - legacy synthetic loop runner: `npm run bench:loop:diag -- --loops 1 --build-profile release --warmup 1`
   - live dashboard: `node tools/scripts/dashboard-server.mjs`
   - optional external contenders are configured in `tools/scripts/competitors.json`; `ripgrep` is the baseline and `ugrep` is the current best-contender lane when available locally
 - Reports:
-  - `tools/reports/live-metrics.jsonl` (append-only history)
-  - `tools/reports/latest.json` (latest snapshot)
+  - `tools/reports/live-metrics.jsonl` (append-only live diagnostics history written by `npm run bench:loop`)
+  - `tools/reports/latest.json` (latest live diagnostics snapshot)
+  - `tools/reports/self-improvement-baseline.json` (preserved profile-normalized baseline used after live-window resets)
   - `tools/reports/bench/v2-vs-rg-*.json` (full range report artifact)
   - `tools/reports/bench/latest.json` (latest range report)
-  - `tools/reports/bench/ripgrep-benchsuite-*.csv` (canonical ripgrep benchsuite raw data)
+  - `tools/reports/bench/ugrep-vs-iex-rg-direct-*.json` (direct contender rerun artifact on codedb)
+  - `tools/reports/bench/contenders-direct-latest.json` (latest direct contender rerun)
+  - `tools/reports/bench/ripgrep-benchsuite-*.csv` (latest raw ripgrep benchsuite artifact written by `npm run bench:report`)
   - `.docs/bench/metrics-index.md` (human-readable metric interpretation guide)
-- Canonical performance measurement is ripgrep suite output; diagnostic harness remains available for instrumentation and tuning.
+- Dashboard provenance: the live monitor summarizes `tools/reports/live-metrics.jsonl` and separately surfaces the latest `ripgrep-benchsuite-*.csv` artifact so benchsuite refresh status stays visible beside the live diagnostics feed.
+- Canonical performance measurement is the ripgrep benchsuite raw artifact plus the live iEx diagnostics window; the live diagnostics harness remains available for instrumentation and tuning.
 - Metric model:
   - `iexMs`: iEx core engine time (`report.stats.timings.total_ms`)
   - `iexCliMs`: full CLI wall-clock time (startup + parse + engine + output)

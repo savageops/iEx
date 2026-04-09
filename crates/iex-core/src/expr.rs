@@ -39,6 +39,7 @@ enum Predicate {
 #[derive(Debug, Clone)]
 enum RegexFastPath {
     PlainLiteral {
+        needle_len: usize,
         finder: memmem::Finder<'static>,
     },
     WordBoundaryLiteral {
@@ -47,6 +48,7 @@ enum RegexFastPath {
     },
     LiteralAlternates {
         automaton: AhoCorasick,
+        max_literal_len: usize,
     },
 }
 
@@ -180,11 +182,13 @@ impl ExpressionPlan {
             [Predicate::Regex {
                 bytes, fast_path, ..
             }] => Some(match fast_path {
-                Some(RegexFastPath::PlainLiteral { finder }) => finder.find_iter(haystack).count(),
+                Some(RegexFastPath::PlainLiteral { finder, .. }) => {
+                    finder.find_iter(haystack).count()
+                }
                 Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                     count_word_boundary_literal_occurrences_bytes(haystack, literal, finder)
                 }
-                Some(RegexFastPath::LiteralAlternates { automaton }) => {
+                Some(RegexFastPath::LiteralAlternates { automaton, .. }) => {
                     count_alternate_literal_occurrences_bytes(haystack, automaton)
                 }
                 None => bytes.find_iter(haystack).count(),
@@ -198,6 +202,63 @@ impl ExpressionPlan {
             _ => None,
         }
     }
+
+    pub fn fast_match_count_no_hits_bytes_in_range(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let bounded_end = end.min(haystack.len());
+        if start >= bounded_end {
+            return Some(0);
+        }
+
+        match self.compiled.as_slice() {
+            [Predicate::Regex { fast_path, .. }] => match fast_path {
+                Some(RegexFastPath::PlainLiteral { needle_len, finder }) => {
+                    Some(count_literal_occurrences_bytes_in_range(
+                        haystack,
+                        finder,
+                        *needle_len,
+                        start,
+                        bounded_end,
+                    ))
+                }
+                Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
+                    Some(count_word_boundary_literal_occurrences_bytes_in_range(
+                        haystack,
+                        literal,
+                        finder,
+                        start,
+                        bounded_end,
+                    ))
+                }
+                Some(RegexFastPath::LiteralAlternates {
+                    automaton,
+                    max_literal_len,
+                }) => Some(count_alternate_literal_occurrences_bytes_in_range(
+                    haystack,
+                    automaton,
+                    *max_literal_len,
+                    start,
+                    bounded_end,
+                )),
+                None => None,
+            },
+            [Predicate::Literal { bytes, finder, .. }] => {
+                Some(count_literal_occurrences_bytes_in_range(
+                    haystack,
+                    finder,
+                    bytes.len(),
+                    start,
+                    bounded_end,
+                ))
+            }
+            _ => None,
+        }
+    }
+
 }
 
 fn parse_token(token: &str) -> Result<(Predicate, PredicateDescriptor)> {
@@ -289,11 +350,11 @@ fn predicate_matches_bytes(predicate: &Predicate, haystack: &[u8]) -> bool {
         Predicate::Regex {
             bytes, fast_path, ..
         } => match fast_path {
-            Some(RegexFastPath::PlainLiteral { finder }) => finder.find(haystack).is_some(),
+            Some(RegexFastPath::PlainLiteral { finder, .. }) => finder.find(haystack).is_some(),
             Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                 first_word_boundary_literal_column_bytes(haystack, literal, finder).is_some()
             }
-            Some(RegexFastPath::LiteralAlternates { automaton }) => {
+            Some(RegexFastPath::LiteralAlternates { automaton, .. }) => {
                 first_alternate_literal_match(haystack, automaton, 0).is_some()
             }
             None => bytes.is_match(haystack),
@@ -311,11 +372,11 @@ fn predicate_column_bytes(predicate: &Predicate, haystack: &[u8]) -> Option<usiz
         Predicate::Regex {
             bytes, fast_path, ..
         } => match fast_path {
-            Some(RegexFastPath::PlainLiteral { finder }) => finder.find(haystack),
+            Some(RegexFastPath::PlainLiteral { finder, .. }) => finder.find(haystack),
             Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                 first_word_boundary_literal_column_bytes(haystack, literal, finder)
             }
-            Some(RegexFastPath::LiteralAlternates { automaton }) => {
+            Some(RegexFastPath::LiteralAlternates { automaton, .. }) => {
                 first_alternate_literal_match(haystack, automaton, 0)
             }
             None => bytes.find(haystack).map(|m| m.start()),
@@ -339,6 +400,7 @@ fn classify_regex_fast_path(pattern: &str) -> Option<RegexFastPath> {
 
     if !case_insensitive && is_plain_ascii_literal(core_pattern) {
         return Some(RegexFastPath::PlainLiteral {
+            needle_len: core_pattern.len(),
             finder: owned_finder(core_pattern.as_bytes()),
         });
     }
@@ -352,8 +414,12 @@ fn classify_regex_fast_path(pattern: &str) -> Option<RegexFastPath> {
         .into_iter()
         .map(|part| part.into_bytes())
         .collect();
+    let max_literal_len = literals.iter().map(Vec::len).max()?;
     let automaton = build_literal_automaton(literals, case_insensitive)?;
-    Some(RegexFastPath::LiteralAlternates { automaton })
+    Some(RegexFastPath::LiteralAlternates {
+        automaton,
+        max_literal_len,
+    })
 }
 
 fn split_case_insensitive_prefix(pattern: &str) -> (bool, &str) {
@@ -458,6 +524,53 @@ fn count_word_boundary_literal_occurrences_bytes(
         .count()
 }
 
+fn count_literal_occurrences_bytes_in_range(
+    haystack: &[u8],
+    finder: &memmem::Finder<'static>,
+    needle_len: usize,
+    start: usize,
+    end: usize,
+) -> usize {
+    if needle_len == 0 || start >= end {
+        return 0;
+    }
+
+    let overlap = needle_len.saturating_sub(1);
+    let slice_start = start.saturating_sub(overlap);
+    let slice_end = haystack.len().min(end.saturating_add(overlap));
+
+    finder
+        .find_iter(&haystack[slice_start..slice_end])
+        .map(|offset| slice_start + offset)
+        .filter(|&absolute_start| absolute_start >= start && absolute_start < end)
+        .count()
+}
+
+fn count_word_boundary_literal_occurrences_bytes_in_range(
+    haystack: &[u8],
+    literal: &[u8],
+    finder: &memmem::Finder<'static>,
+    start: usize,
+    end: usize,
+) -> usize {
+    if literal.is_empty() || start >= end {
+        return 0;
+    }
+
+    let overlap = literal.len();
+    let slice_start = start.saturating_sub(overlap);
+    let slice_end = haystack.len().min(end.saturating_add(overlap));
+
+    finder
+        .find_iter(&haystack[slice_start..slice_end])
+        .map(|offset| slice_start + offset)
+        .filter(|&absolute_start| absolute_start >= start && absolute_start < end)
+        .filter(|&absolute_start| {
+            has_ascii_word_boundaries(haystack, absolute_start, literal.len())
+        })
+        .count()
+}
+
 fn first_alternate_literal_match(
     haystack: &[u8],
     automaton: &AhoCorasick,
@@ -473,6 +586,28 @@ fn first_alternate_literal_match(
 
 fn count_alternate_literal_occurrences_bytes(haystack: &[u8], automaton: &AhoCorasick) -> usize {
     automaton.find_iter(haystack).count()
+}
+
+fn count_alternate_literal_occurrences_bytes_in_range(
+    haystack: &[u8],
+    automaton: &AhoCorasick,
+    max_literal_len: usize,
+    start: usize,
+    end: usize,
+) -> usize {
+    if max_literal_len == 0 || start >= end {
+        return 0;
+    }
+
+    let overlap = max_literal_len.saturating_sub(1);
+    let slice_start = start.saturating_sub(overlap);
+    let slice_end = haystack.len().min(end.saturating_add(overlap));
+
+    automaton
+        .find_iter(&haystack[slice_start..slice_end])
+        .map(|m| slice_start + m.start())
+        .filter(|&absolute_start| absolute_start >= start && absolute_start < end)
+        .count()
 }
 
 #[cfg(test)]
@@ -533,6 +668,66 @@ mod tests {
         assert_eq!(
             plan.fast_match_count_no_hits_bytes(b"ERR nope ERR"),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn literal_range_count_matches_full_count() {
+        let plan = ExpressionPlan::parse("lit:abc").expect("plan should parse");
+        let haystack = b"xxabcabcxxabc";
+        let ranged = [
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 0, 4),
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 4, 9),
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 9, haystack.len()),
+        ]
+        .into_iter()
+        .map(|count| count.expect("range count should use literal fast path"))
+        .sum::<usize>();
+
+        assert_eq!(
+            ranged,
+            plan.fast_match_count_no_hits_bytes(haystack)
+                .unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn word_boundary_range_count_matches_full_count() {
+        let plan = ExpressionPlan::parse(r"re:\bPM_RESUME\b").expect("plan should parse");
+        let haystack = b"PM_RESUME xPM_RESUME PM_RESUME PM_RESUME2 PM_RESUME";
+        let ranged = [
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 0, 11),
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 11, 33),
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 33, haystack.len()),
+        ]
+        .into_iter()
+        .map(|count| count.expect("range count should use word-boundary fast path"))
+        .sum::<usize>();
+
+        assert_eq!(
+            ranged,
+            plan.fast_match_count_no_hits_bytes(haystack)
+                .unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn alternates_range_count_matches_full_count() {
+        let plan = ExpressionPlan::parse(r"re:(abc|wxyz)").expect("plan should parse");
+        let haystack = b"abc---wxyz---abcwxyz---wxyz";
+        let ranged = [
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 0, 8),
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 8, 18),
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 18, haystack.len()),
+        ]
+        .into_iter()
+        .map(|count| count.expect("range count should use alternates fast path"))
+        .sum::<usize>();
+
+        assert_eq!(
+            ranged,
+            plan.fast_match_count_no_hits_bytes(haystack)
+                .unwrap_or_default()
         );
     }
 }

@@ -15,8 +15,12 @@ use serde::Serialize;
 
 use crate::{expr::ExpressionPlan, stats::SearchStats};
 
+const TINY_FILE_INLINE_LIMIT: usize = 16 * 1024;
 const SMALL_FILE_INLINE_LIMIT: u64 = 256 * 1024;
 const BINARY_SNIFF_LIMIT: usize = 1024;
+const PARALLEL_FAST_COUNT_FILE_THRESHOLD: usize = 64 * 1024 * 1024;
+const PARALLEL_FAST_COUNT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PARALLEL_FAST_COUNT_THREADS: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
@@ -75,53 +79,25 @@ pub fn run_search(config: &SearchConfig) -> Result<SearchReport> {
 fn run_search_inner(config: &SearchConfig) -> Result<SearchReport> {
     let total_started = Instant::now();
     let mut stats = SearchStats::default();
-
+    let mut hits = Vec::new();
     let discover_started = Instant::now();
     let files = discover_files(config)?;
     stats.timings.discover_ms = discover_started.elapsed().as_secs_f64() * 1_000.0;
     stats.files_discovered = files.len();
 
-    let scan_started = Instant::now();
-    let collect_hits = config.collect_hits;
     let resolved_threads = config
         .threads
-        .unwrap_or_else(|| auto_threads_for_files(files.len()));
-    let mut outcomes: Vec<FileScanOutcome> = if resolved_threads <= 1 {
-        files
-            .iter()
-            .map(|path| scan_file(path, &config.plan, collect_hits))
-            .collect()
-    } else {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(resolved_threads)
-            .build()
-            .context("failed to configure rayon thread pool")?;
-        pool.install(|| {
-            files
-                .par_iter()
-                .map(|path| scan_file(path, &config.plan, collect_hits))
-                .collect()
-        })
-    };
+        .unwrap_or_else(|| auto_threads_for_shape(files.len()));
+    let scan_started = Instant::now();
+    let mut outcomes = scan_paths(&files, &config.plan, config.collect_hits, resolved_threads)?;
     stats.timings.scan_ms = scan_started.elapsed().as_secs_f64() * 1_000.0;
 
-    let aggregate_started = Instant::now();
-    let mut hits = Vec::new();
     for outcome in outcomes.drain(..) {
-        if outcome.scanned {
-            stats.files_scanned += 1;
-            stats.bytes_scanned += outcome.bytes;
-            stats.consider_slow_file(&outcome.path, outcome.duration_ms, outcome.bytes);
-            stats.matches_found += outcome.match_count;
-            if collect_hits {
-                hits.extend(outcome.hits);
-            }
-        } else {
-            stats.files_skipped += 1;
-        }
+        merge_outcome(&mut stats, &mut hits, config.collect_hits, outcome);
     }
 
-    if collect_hits {
+    let aggregate_started = Instant::now();
+    if config.collect_hits {
         hits.sort_by(|a, b| {
             a.path
                 .cmp(&b.path)
@@ -143,6 +119,17 @@ fn run_search_inner(config: &SearchConfig) -> Result<SearchReport> {
 }
 
 fn discover_files(config: &SearchConfig) -> Result<Vec<PathBuf>> {
+    if std::fs::metadata(&config.root)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Ok(vec![config.root.clone()]);
+    }
+
+    discover_files_parallel(config)
+}
+
+fn build_walk_builder(config: &SearchConfig) -> WalkBuilder {
     let mut builder = WalkBuilder::new(&config.root);
     builder
         .hidden(!config.include_hidden)
@@ -152,7 +139,11 @@ fn discover_files(config: &SearchConfig) -> Result<Vec<PathBuf>> {
         .git_exclude(true)
         .ignore(true)
         .parents(true);
+    builder
+}
 
+fn discover_files_parallel(config: &SearchConfig) -> Result<Vec<PathBuf>> {
+    let builder = build_walk_builder(config);
     let (sender, receiver) = mpsc::channel::<PathBuf>();
     let walker = builder.build_parallel();
     walker.run(|| {
@@ -172,13 +163,14 @@ fn discover_files(config: &SearchConfig) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn auto_threads_for_files(file_count: usize) -> usize {
+fn auto_threads_for_shape(file_count: usize) -> usize {
     let available = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    let file_tier = if file_count <= 64 {
-        2
-    } else if file_count <= 256 {
+
+    let desired = if file_count <= 24 {
+        1
+    } else if file_count <= 128 {
         4
     } else if file_count <= 1_024 {
         8
@@ -187,47 +179,149 @@ fn auto_threads_for_files(file_count: usize) -> usize {
     } else {
         16
     };
-    available.min(file_tier).max(1)
+    available.min(desired).max(1)
 }
 
-fn scan_file(path: &Path, plan: &ExpressionPlan, collect_hits: bool) -> FileScanOutcome {
-    let started = Instant::now();
-
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return failed_outcome(path, started, 0),
-    };
-
-    let metadata = match file.metadata() {
-        Ok(metadata) => metadata,
-        Err(_) => return failed_outcome(path, started, 0),
-    };
-
-    if metadata.len() <= SMALL_FILE_INLINE_LIMIT {
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        if file.read_to_end(&mut bytes).is_err() {
-            return failed_outcome(path, started, metadata.len());
-        }
-        return scan_loaded_bytes(path, plan, collect_hits, &bytes, metadata.len(), started);
+fn scan_paths(
+    files: &[PathBuf],
+    plan: &ExpressionPlan,
+    collect_hits: bool,
+    resolved_threads: usize,
+) -> Result<Vec<FileScanOutcome>> {
+    if resolved_threads <= 1 {
+        return Ok(files
+            .iter()
+            .map(|path| scan_file(path, plan, collect_hits, resolved_threads))
+            .collect());
     }
 
-    let mmap = match unsafe { MmapOptions::new().map(&file) } {
-        Ok(mmap) => mmap,
-        Err(_) => return failed_outcome(path, started, metadata.len()),
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(resolved_threads)
+        .build()
+        .context("failed to configure rayon thread pool")?;
+    Ok(pool.install(|| {
+        files
+            .par_iter()
+            .map(|path| scan_file(path, plan, collect_hits, resolved_threads))
+            .collect()
+    }))
+}
+
+fn merge_outcome(
+    stats: &mut SearchStats,
+    hits: &mut Vec<SearchHit>,
+    collect_hits: bool,
+    outcome: FileScanOutcome,
+) {
+    if outcome.scanned {
+        stats.files_scanned += 1;
+        stats.bytes_scanned += outcome.bytes;
+        stats.consider_slow_file(&outcome.path, outcome.duration_ms, outcome.bytes);
+        stats.matches_found += outcome.match_count;
+        if collect_hits {
+            hits.extend(outcome.hits);
+        }
+    } else {
+        stats.files_skipped += 1;
+    }
+}
+
+fn scan_file(
+    path: &Path,
+    plan: &ExpressionPlan,
+    collect_hits: bool,
+    thread_budget: usize,
+) -> FileScanOutcome {
+    let started = Instant::now();
+    let mut outcome = {
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(_) => return failed_outcome(path, 0),
+        };
+
+        let mut tiny = [0u8; TINY_FILE_INLINE_LIMIT];
+        let tiny_read = match file.read(&mut tiny) {
+            Ok(read) => read,
+            Err(_) => return failed_outcome(path, 0),
+        };
+
+        if tiny_read < TINY_FILE_INLINE_LIMIT {
+            scan_loaded_bytes(
+                path,
+                plan,
+                collect_hits,
+                thread_budget,
+                &tiny[..tiny_read],
+                tiny_read as u64,
+            )
+        } else {
+            let mut sentinel = [0u8; 1];
+            let sentinel_read = match file.read(&mut sentinel) {
+                Ok(read) => read,
+                Err(_) => return failed_outcome(path, tiny_read as u64),
+            };
+
+            if sentinel_read == 0 {
+                scan_loaded_bytes(
+                    path,
+                    plan,
+                    collect_hits,
+                    thread_budget,
+                    &tiny,
+                    tiny.len() as u64,
+                )
+            } else {
+                let metadata = match file.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => return failed_outcome(path, (tiny_read + sentinel_read) as u64),
+                };
+
+                if metadata.len() <= SMALL_FILE_INLINE_LIMIT {
+                    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                    bytes.extend_from_slice(&tiny);
+                    bytes.push(sentinel[0]);
+                    if file.read_to_end(&mut bytes).is_err() {
+                        return failed_outcome(path, metadata.len());
+                    }
+                    scan_loaded_bytes(
+                        path,
+                        plan,
+                        collect_hits,
+                        thread_budget,
+                        &bytes,
+                        metadata.len(),
+                    )
+                } else {
+                    let mmap = match unsafe { MmapOptions::new().map(&file) } {
+                        Ok(mmap) => mmap,
+                        Err(_) => return failed_outcome(path, metadata.len()),
+                    };
+                    scan_loaded_bytes(
+                        path,
+                        plan,
+                        collect_hits,
+                        thread_budget,
+                        &mmap,
+                        metadata.len(),
+                    )
+                }
+            }
+        }
     };
-    scan_loaded_bytes(path, plan, collect_hits, &mmap, metadata.len(), started)
+    outcome.duration_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    outcome
 }
 
 fn scan_loaded_bytes(
     path: &Path,
     plan: &ExpressionPlan,
     collect_hits: bool,
+    thread_budget: usize,
     bytes: &[u8],
     file_bytes: u64,
-    started: Instant,
 ) -> FileScanOutcome {
     if is_likely_binary(bytes) {
-        return failed_outcome(path, started, file_bytes);
+        return failed_outcome(path, file_bytes);
     }
 
     let mut hits = Vec::new();
@@ -235,9 +329,13 @@ fn scan_loaded_bytes(
     let mut cached_path = None::<String>;
 
     if !collect_hits {
+        if let Some(count) = maybe_parallel_fast_count_bytes(plan, bytes, thread_budget) {
+            match_count = count;
+            return completed_outcome(path, file_bytes, hits, match_count);
+        }
         if let Some(count) = plan.fast_match_count_no_hits_bytes(bytes) {
             match_count = count;
-            return completed_outcome(path, started, file_bytes, hits, match_count);
+            return completed_outcome(path, file_bytes, hits, match_count);
         }
     }
 
@@ -287,7 +385,7 @@ fn scan_loaded_bytes(
         if !collect_hits {
             if let Some(count) = plan.fast_match_count_no_hits(&text) {
                 match_count = count;
-                return completed_outcome(path, started, file_bytes, hits, match_count);
+                return completed_outcome(path, file_bytes, hits, match_count);
             }
         }
 
@@ -309,7 +407,7 @@ fn scan_loaded_bytes(
         }
     }
 
-    completed_outcome(path, started, file_bytes, hits, match_count)
+    completed_outcome(path, file_bytes, hits, match_count)
 }
 
 fn is_likely_binary(bytes: &[u8]) -> bool {
@@ -317,16 +415,67 @@ fn is_likely_binary(bytes: &[u8]) -> bool {
     bytes[..sniff_len].contains(&0)
 }
 
+fn maybe_parallel_fast_count_bytes(
+    plan: &ExpressionPlan,
+    bytes: &[u8],
+    thread_budget: usize,
+) -> Option<usize> {
+    if thread_budget > 1 || bytes.len() < PARALLEL_FAST_COUNT_FILE_THRESHOLD {
+        return None;
+    }
+
+    let available_threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_PARALLEL_FAST_COUNT_THREADS);
+    if available_threads <= 1 {
+        return None;
+    }
+
+    let chunk_size = bytes
+        .len()
+        .div_ceil(available_threads.saturating_mul(2))
+        .max(PARALLEL_FAST_COUNT_CHUNK_BYTES);
+    let ranges = build_chunk_ranges(bytes.len(), chunk_size);
+    if ranges.len() <= 1 {
+        return None;
+    }
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(available_threads)
+        .build()
+        .ok()?;
+    pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|(start, end)| plan.fast_match_count_no_hits_bytes_in_range(bytes, *start, *end))
+            .collect::<Option<Vec<_>>>()
+            .map(|counts| counts.into_iter().sum())
+    })
+}
+
+fn build_chunk_ranges(total_len: usize, chunk_size: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+
+    while start < total_len {
+        let end = total_len.min(start.saturating_add(chunk_size));
+        ranges.push((start, end));
+        start = end;
+    }
+
+    ranges
+}
+
 fn completed_outcome(
     path: &Path,
-    started: Instant,
     bytes: u64,
     hits: Vec<SearchHit>,
     match_count: usize,
 ) -> FileScanOutcome {
     FileScanOutcome {
         path: path.to_path_buf(),
-        duration_ms: started.elapsed().as_secs_f64() * 1_000.0,
+        duration_ms: 0.0,
         bytes,
         hits,
         match_count,
@@ -334,10 +483,10 @@ fn completed_outcome(
     }
 }
 
-fn failed_outcome(path: &Path, started: Instant, bytes: u64) -> FileScanOutcome {
+fn failed_outcome(path: &Path, bytes: u64) -> FileScanOutcome {
     FileScanOutcome {
         path: path.to_path_buf(),
-        duration_ms: started.elapsed().as_secs_f64() * 1_000.0,
+        duration_ms: 0.0,
         bytes,
         hits: Vec::new(),
         match_count: 0,
@@ -347,15 +496,70 @@ fn failed_outcome(path: &Path, started: Instant, bytes: u64) -> FileScanOutcome 
 
 #[cfg(test)]
 mod tests {
-    use super::auto_threads_for_files;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use crate::ExpressionPlan;
+
+    use super::{auto_threads_for_shape, discover_files, run_search, SearchConfig};
 
     #[test]
     fn auto_threads_scales_monotonically_with_file_count() {
-        let tiny = auto_threads_for_files(16);
-        let medium = auto_threads_for_files(1_000);
-        let huge = auto_threads_for_files(100_000);
+        let tiny = auto_threads_for_shape(16);
+        let medium = auto_threads_for_shape(1_000);
+        let huge = auto_threads_for_shape(100_000);
         assert!(tiny >= 1);
         assert!(medium >= tiny);
         assert!(huge >= medium);
+    }
+
+    #[test]
+    fn auto_threads_uses_parallelism_for_large_corpora_without_byte_samples() {
+        assert_eq!(auto_threads_for_shape(1), 1);
+        assert!(auto_threads_for_shape(2_048) >= 8);
+    }
+
+    #[test]
+    fn auto_search_handles_small_corpus_end_to_end() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("iex-engine-small-corpus-{unique}"));
+        fs::create_dir_all(&root).expect("temp corpus should be created");
+        fs::write(root.join("one.txt"), "alpha\nneedle here\n")
+            .expect("first fixture should write");
+        fs::write(root.join("two.txt"), "needle again\n").expect("second fixture should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let report =
+            run_search(&SearchConfig::new(root.clone(), plan)).expect("search should succeed");
+
+        assert_eq!(report.stats.files_discovered, 2);
+        assert_eq!(report.stats.files_scanned, 2);
+        assert_eq!(report.stats.files_skipped, 0);
+        assert_eq!(report.stats.matches_found, 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discover_files_treats_direct_file_root_as_single_scan_target() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("iex-engine-file-root-{unique}.txt"));
+        fs::write(&root, "needle here\n").expect("fixture file should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let config = SearchConfig::new(root.clone(), plan);
+        let files = discover_files(&config).expect("single file discovery should succeed");
+
+        assert_eq!(files, vec![root.clone()]);
+
+        let _ = fs::remove_file(root);
     }
 }
