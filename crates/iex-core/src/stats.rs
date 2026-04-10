@@ -19,6 +19,12 @@ pub struct SlowFileStat {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchStats {
+    pub input_roots: usize,
+    pub effective_roots: usize,
+    pub pruned_roots: usize,
+    pub overlap_pruned_roots: usize,
+    pub discovered_duplicate_paths: usize,
+    pub acceleration_bailouts: usize,
     pub files_discovered: usize,
     pub files_scanned: usize,
     pub files_skipped: usize,
@@ -31,6 +37,12 @@ pub struct SearchStats {
 impl Default for SearchStats {
     fn default() -> Self {
         Self {
+            input_roots: 0,
+            effective_roots: 0,
+            pruned_roots: 0,
+            overlap_pruned_roots: 0,
+            discovered_duplicate_paths: 0,
+            acceleration_bailouts: 0,
             files_discovered: 0,
             files_scanned: 0,
             files_skipped: 0,

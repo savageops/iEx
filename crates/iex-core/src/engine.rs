@@ -59,6 +59,21 @@ struct FileScanOutcome {
     scanned: bool,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct DiscoveryTelemetry {
+    input_roots: usize,
+    effective_roots: usize,
+    pruned_roots: usize,
+    overlap_pruned_roots: usize,
+    discovered_duplicate_paths: usize,
+}
+
+#[derive(Debug)]
+struct DiscoveryResult {
+    files: Vec<PathBuf>,
+    telemetry: DiscoveryTelemetry,
+}
+
 impl SearchConfig {
     pub fn new(root: PathBuf, plan: ExpressionPlan) -> Self {
         Self::from_roots(vec![root], plan)
@@ -89,15 +104,25 @@ fn run_search_inner(config: &SearchConfig) -> Result<SearchReport> {
     let mut stats = SearchStats::default();
     let mut hits = Vec::new();
     let discover_started = Instant::now();
-    let files = discover_files(config)?;
+    let discovery = discover_files(config)?;
     stats.timings.discover_ms = discover_started.elapsed().as_secs_f64() * 1_000.0;
-    stats.files_discovered = files.len();
+    stats.input_roots = discovery.telemetry.input_roots;
+    stats.effective_roots = discovery.telemetry.effective_roots;
+    stats.pruned_roots = discovery.telemetry.pruned_roots;
+    stats.overlap_pruned_roots = discovery.telemetry.overlap_pruned_roots;
+    stats.discovered_duplicate_paths = discovery.telemetry.discovered_duplicate_paths;
+    stats.files_discovered = discovery.files.len();
 
     let resolved_threads = config
         .threads
-        .unwrap_or_else(|| auto_threads_for_shape(files.len()));
+        .unwrap_or_else(|| auto_threads_for_shape(discovery.files.len()));
     let scan_started = Instant::now();
-    let mut outcomes = scan_paths(&files, &config.plan, config.collect_hits, resolved_threads)?;
+    let mut outcomes = scan_paths(
+        &discovery.files,
+        &config.plan,
+        config.collect_hits,
+        resolved_threads,
+    )?;
     stats.timings.scan_ms = scan_started.elapsed().as_secs_f64() * 1_000.0;
 
     for outcome in outcomes.drain(..) {
@@ -126,16 +151,30 @@ fn run_search_inner(config: &SearchConfig) -> Result<SearchReport> {
     })
 }
 
-fn discover_files(config: &SearchConfig) -> Result<Vec<PathBuf>> {
+fn discover_files(config: &SearchConfig) -> Result<DiscoveryResult> {
     let roots = partition_roots(config);
     if roots.directory_roots.is_empty() {
-        return Ok(finalize_discovered_files(roots.direct_files, false));
+        let files = finalize_discovered_files(roots.direct_files, roots.telemetry.effective_roots > 1);
+        return Ok(DiscoveryResult {
+            files: files.files,
+            telemetry: DiscoveryTelemetry {
+                discovered_duplicate_paths: files.duplicate_paths,
+                ..roots.telemetry
+            },
+        });
     }
 
-    let needs_dedupe = config.roots.len() > 1 || !roots.direct_files.is_empty();
+    let needs_dedupe = roots.telemetry.effective_roots > 1;
     let mut files = roots.direct_files;
     files.extend(discover_files_parallel(config, &roots.directory_roots)?);
-    Ok(finalize_discovered_files(files, needs_dedupe))
+    let files = finalize_discovered_files(files, needs_dedupe);
+    Ok(DiscoveryResult {
+        files: files.files,
+        telemetry: DiscoveryTelemetry {
+            discovered_duplicate_paths: files.duplicate_paths,
+            ..roots.telemetry
+        },
+    })
 }
 
 fn build_walk_builder(config: &SearchConfig, roots: &[PathBuf]) -> WalkBuilder {
@@ -179,38 +218,163 @@ fn discover_files_parallel(config: &SearchConfig, roots: &[PathBuf]) -> Result<V
 struct RootTargets {
     direct_files: Vec<PathBuf>,
     directory_roots: Vec<PathBuf>,
+    telemetry: DiscoveryTelemetry,
 }
 
 fn partition_roots(config: &SearchConfig) -> RootTargets {
+    let normalized = normalize_roots(&config.roots);
     let mut direct_files = Vec::new();
     let mut directory_roots = Vec::new();
 
-    for root in &config.roots {
-        if std::fs::metadata(root)
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false)
-        {
-            direct_files.push(root.clone());
-        } else {
-            directory_roots.push(root.clone());
+    for root in &normalized.roots {
+        match root.kind {
+            RootKind::File => direct_files.push(root.path.clone()),
+            RootKind::Directory => directory_roots.push(root.path.clone()),
         }
     }
 
     RootTargets {
         direct_files,
         directory_roots,
+        telemetry: DiscoveryTelemetry {
+            input_roots: config.roots.len(),
+            effective_roots: normalized.roots.len(),
+            pruned_roots: config.roots.len().saturating_sub(normalized.roots.len()),
+            overlap_pruned_roots: normalized.overlap_pruned_roots,
+            discovered_duplicate_paths: 0,
+        },
     }
 }
 
-fn finalize_discovered_files(files: Vec<PathBuf>, dedupe: bool) -> Vec<PathBuf> {
+#[derive(Debug, Clone)]
+struct FinalizedFiles {
+    files: Vec<PathBuf>,
+    duplicate_paths: usize,
+}
+
+fn finalize_discovered_files(files: Vec<PathBuf>, dedupe: bool) -> FinalizedFiles {
     if !dedupe {
-        return files;
+        return FinalizedFiles {
+            files,
+            duplicate_paths: 0,
+        };
     }
-    let mut unique = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut unique = Vec::with_capacity(files.len());
+    let mut duplicate_paths = 0usize;
     for path in files {
-        unique.insert(path);
+        if seen.insert(path.clone()) {
+            unique.push(path);
+        } else {
+            duplicate_paths += 1;
+        }
     }
-    unique.into_iter().collect()
+    FinalizedFiles {
+        files: unique,
+        duplicate_paths,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedRoot {
+    index: usize,
+    path: PathBuf,
+    canonical: Option<PathBuf>,
+    kind: RootKind,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedRoots {
+    roots: Vec<NormalizedRoot>,
+    overlap_pruned_roots: usize,
+}
+
+fn normalize_roots(roots: &[PathBuf]) -> NormalizedRoots {
+    let candidates: Vec<NormalizedRoot> = roots
+        .iter()
+        .enumerate()
+        .map(|(index, path)| classify_root(index, path))
+        .collect();
+    let mut retained = Vec::new();
+    let mut overlap_pruned_roots = 0usize;
+
+    for candidate in &candidates {
+        if has_prior_duplicate(candidate, &candidates) {
+            continue;
+        }
+        if is_pruned_by_overlap(candidate, &candidates) {
+            overlap_pruned_roots += 1;
+            continue;
+        }
+        retained.push(candidate.clone());
+    }
+
+    retained.sort_by_key(|root| root.index);
+
+    NormalizedRoots {
+        roots: retained,
+        overlap_pruned_roots,
+    }
+}
+
+fn classify_root(index: usize, path: &Path) -> NormalizedRoot {
+    let kind = if std::fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        RootKind::File
+    } else {
+        RootKind::Directory
+    };
+
+    NormalizedRoot {
+        index,
+        path: path.to_path_buf(),
+        canonical: std::fs::canonicalize(path).ok(),
+        kind,
+    }
+}
+
+fn has_prior_duplicate(candidate: &NormalizedRoot, roots: &[NormalizedRoot]) -> bool {
+    roots.iter()
+        .filter(|other| other.index < candidate.index)
+        .any(|other| roots_equivalent(candidate, other))
+}
+
+fn is_pruned_by_overlap(candidate: &NormalizedRoot, roots: &[NormalizedRoot]) -> bool {
+    match candidate.kind {
+        RootKind::Directory => roots.iter().any(|other| {
+            other.index != candidate.index
+                && other.kind == RootKind::Directory
+                && is_strict_descendant(candidate, other)
+        }),
+        RootKind::File => roots.iter().any(|other| {
+            other.kind == RootKind::Directory && is_strict_descendant(candidate, other)
+        }),
+    }
+}
+
+fn roots_equivalent(left: &NormalizedRoot, right: &NormalizedRoot) -> bool {
+    match (left.canonical.as_deref(), right.canonical.as_deref()) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.path == right.path,
+    }
+}
+
+fn is_strict_descendant(candidate: &NormalizedRoot, parent: &NormalizedRoot) -> bool {
+    let candidate_path = comparable_root_path(candidate);
+    let parent_path = comparable_root_path(parent);
+    candidate_path != parent_path && candidate_path.starts_with(parent_path)
+}
+
+fn comparable_root_path(root: &NormalizedRoot) -> &Path {
+    root.canonical.as_deref().unwrap_or(root.path.as_path())
 }
 
 fn auto_threads_for_shape(file_count: usize) -> usize {
@@ -548,12 +712,21 @@ fn failed_outcome(path: &Path, bytes: u64) -> FileScanOutcome {
 mod tests {
     use std::{
         fs,
+        path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use crate::ExpressionPlan;
 
     use super::{auto_threads_for_shape, discover_files, run_search, SearchConfig};
+
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{unique}"))
+    }
 
     #[test]
     fn auto_threads_scales_monotonically_with_file_count() {
@@ -573,11 +746,7 @@ mod tests {
 
     #[test]
     fn auto_search_handles_small_corpus_end_to_end() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be valid")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("iex-engine-small-corpus-{unique}"));
+        let root = unique_temp_path("iex-engine-small-corpus");
         fs::create_dir_all(&root).expect("temp corpus should be created");
         fs::write(root.join("one.txt"), "alpha\nneedle here\n")
             .expect("first fixture should write");
@@ -591,35 +760,38 @@ mod tests {
         assert_eq!(report.stats.files_scanned, 2);
         assert_eq!(report.stats.files_skipped, 0);
         assert_eq!(report.stats.matches_found, 2);
+        assert_eq!(report.stats.input_roots, 1);
+        assert_eq!(report.stats.effective_roots, 1);
+        assert_eq!(report.stats.pruned_roots, 0);
+        assert_eq!(report.stats.overlap_pruned_roots, 0);
+        assert_eq!(report.stats.discovered_duplicate_paths, 0);
+        assert_eq!(report.stats.acceleration_bailouts, 0);
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn discover_files_treats_direct_file_root_as_single_scan_target() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be valid")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("iex-engine-file-root-{unique}.txt"));
+        let root = unique_temp_path("iex-engine-file-root").with_extension("txt");
         fs::write(&root, "needle here\n").expect("fixture file should write");
 
         let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
         let config = SearchConfig::new(root.clone(), plan);
-        let files = discover_files(&config).expect("single file discovery should succeed");
+        let discovery = discover_files(&config).expect("single file discovery should succeed");
 
-        assert_eq!(files, vec![root.clone()]);
+        assert_eq!(discovery.files, vec![root.clone()]);
+        assert_eq!(discovery.telemetry.input_roots, 1);
+        assert_eq!(discovery.telemetry.effective_roots, 1);
+        assert_eq!(discovery.telemetry.pruned_roots, 0);
+        assert_eq!(discovery.telemetry.overlap_pruned_roots, 0);
+        assert_eq!(discovery.telemetry.discovered_duplicate_paths, 0);
 
         let _ = fs::remove_file(root);
     }
 
     #[test]
     fn discover_files_supports_multiple_directory_roots() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be valid")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("iex-engine-multi-root-{unique}"));
+        let root = unique_temp_path("iex-engine-multi-root");
         let left = root.join("left");
         let right = root.join("right");
         fs::create_dir_all(&left).expect("left dir should be created");
@@ -629,42 +801,110 @@ mod tests {
 
         let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
         let config = SearchConfig::from_roots(vec![left.clone(), right.clone()], plan);
-        let files = discover_files(&config).expect("multi-root discovery should succeed");
+        let discovery = discover_files(&config).expect("multi-root discovery should succeed");
 
-        assert_eq!(files.len(), 2);
-        assert!(files.contains(&left.join("one.txt")));
-        assert!(files.contains(&right.join("two.txt")));
+        assert_eq!(discovery.files.len(), 2);
+        assert!(discovery.files.contains(&left.join("one.txt")));
+        assert!(discovery.files.contains(&right.join("two.txt")));
+        assert_eq!(discovery.telemetry.input_roots, 2);
+        assert_eq!(discovery.telemetry.effective_roots, 2);
+        assert_eq!(discovery.telemetry.pruned_roots, 0);
+        assert_eq!(discovery.telemetry.overlap_pruned_roots, 0);
+        assert_eq!(discovery.telemetry.discovered_duplicate_paths, 0);
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn discover_files_dedupes_file_root_under_directory_root() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be valid")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("iex-engine-overlap-root-{unique}"));
+        let root = unique_temp_path("iex-engine-overlap-root");
         fs::create_dir_all(&root).expect("root dir should be created");
         let file = root.join("needle.txt");
         fs::write(&file, "needle here\n").expect("fixture file should write");
 
         let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
         let config = SearchConfig::from_roots(vec![root.clone(), file.clone()], plan);
-        let files = discover_files(&config).expect("overlap discovery should succeed");
+        let discovery = discover_files(&config).expect("overlap discovery should succeed");
 
-        assert_eq!(files, vec![file.clone()]);
+        assert_eq!(discovery.files, vec![file.clone()]);
+        assert_eq!(discovery.telemetry.input_roots, 2);
+        assert_eq!(discovery.telemetry.effective_roots, 1);
+        assert_eq!(discovery.telemetry.pruned_roots, 1);
+        assert_eq!(discovery.telemetry.overlap_pruned_roots, 1);
+        assert_eq!(discovery.telemetry.discovered_duplicate_paths, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discover_files_prunes_duplicate_directory_roots_before_walk() {
+        let root = unique_temp_path("iex-engine-duplicate-root");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        let file = root.join("needle.txt");
+        fs::write(&file, "needle here\n").expect("fixture file should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let config = SearchConfig::from_roots(vec![root.clone(), root.clone()], plan);
+        let discovery = discover_files(&config).expect("duplicate root discovery should succeed");
+
+        assert_eq!(discovery.files, vec![file.clone()]);
+        assert_eq!(discovery.telemetry.input_roots, 2);
+        assert_eq!(discovery.telemetry.effective_roots, 1);
+        assert_eq!(discovery.telemetry.pruned_roots, 1);
+        assert_eq!(discovery.telemetry.overlap_pruned_roots, 0);
+        assert_eq!(discovery.telemetry.discovered_duplicate_paths, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discover_files_prunes_child_directory_even_when_parent_is_later() {
+        let root = unique_temp_path("iex-engine-parent-child-root");
+        let child = root.join("nested");
+        fs::create_dir_all(&child).expect("child dir should be created");
+        let file = child.join("needle.txt");
+        fs::write(&file, "needle here\n").expect("fixture file should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let config = SearchConfig::from_roots(vec![child.clone(), root.clone()], plan);
+        let discovery =
+            discover_files(&config).expect("parent-child root discovery should succeed");
+
+        assert_eq!(discovery.files, vec![file.clone()]);
+        assert_eq!(discovery.telemetry.input_roots, 2);
+        assert_eq!(discovery.telemetry.effective_roots, 1);
+        assert_eq!(discovery.telemetry.pruned_roots, 1);
+        assert_eq!(discovery.telemetry.overlap_pruned_roots, 1);
+        assert_eq!(discovery.telemetry.discovered_duplicate_paths, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discover_files_prunes_contained_file_even_when_directory_is_later() {
+        let root = unique_temp_path("iex-engine-file-parent-root");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        let file = root.join("needle.txt");
+        fs::write(&file, "needle here\n").expect("fixture file should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let config = SearchConfig::from_roots(vec![file.clone(), root.clone()], plan);
+        let discovery =
+            discover_files(&config).expect("mixed file-directory discovery should succeed");
+
+        assert_eq!(discovery.files, vec![file.clone()]);
+        assert_eq!(discovery.telemetry.input_roots, 2);
+        assert_eq!(discovery.telemetry.effective_roots, 1);
+        assert_eq!(discovery.telemetry.pruned_roots, 1);
+        assert_eq!(discovery.telemetry.overlap_pruned_roots, 1);
+        assert_eq!(discovery.telemetry.discovered_duplicate_paths, 0);
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn run_search_supports_multiple_roots_end_to_end() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be valid")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("iex-engine-search-multi-root-{unique}"));
+        let root = unique_temp_path("iex-engine-search-multi-root");
         let left = root.join("left");
         let right = root.join("right");
         fs::create_dir_all(&left).expect("left dir should be created");
@@ -682,6 +922,12 @@ mod tests {
         assert_eq!(report.stats.files_discovered, 2);
         assert_eq!(report.stats.files_scanned, 2);
         assert_eq!(report.stats.matches_found, 2);
+        assert_eq!(report.stats.input_roots, 2);
+        assert_eq!(report.stats.effective_roots, 2);
+        assert_eq!(report.stats.pruned_roots, 0);
+        assert_eq!(report.stats.overlap_pruned_roots, 0);
+        assert_eq!(report.stats.discovered_duplicate_paths, 0);
+        assert_eq!(report.stats.acceleration_bailouts, 0);
 
         let _ = fs::remove_dir_all(root);
     }
