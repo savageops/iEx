@@ -3,7 +3,10 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::Instant,
 };
 
@@ -22,6 +25,8 @@ const BINARY_SNIFF_LIMIT: usize = 1024;
 const PARALLEL_FAST_COUNT_FILE_THRESHOLD: usize = 64 * 1024 * 1024;
 const PARALLEL_FAST_COUNT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PARALLEL_FAST_COUNT_THREADS: usize = 12;
+const MAX_STREAMING_SCAN_THREADS: usize = 12;
+const STREAMING_PATH_QUEUE_MULTIPLIER: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
@@ -74,6 +79,23 @@ struct DiscoveryResult {
     telemetry: DiscoveryTelemetry,
 }
 
+#[derive(Debug)]
+struct StreamingScanResult {
+    outcomes: Vec<FileScanOutcome>,
+    files_discovered: usize,
+    duplicate_paths: usize,
+    discover_ms: f64,
+    scan_ms: f64,
+}
+
+#[derive(Clone)]
+struct DiscoveryDispatch {
+    sender: mpsc::SyncSender<PathBuf>,
+    seen: Option<Arc<Mutex<BTreeSet<PathBuf>>>>,
+    files_discovered: Arc<AtomicUsize>,
+    duplicate_paths: Arc<AtomicUsize>,
+}
+
 impl SearchConfig {
     pub fn new(root: PathBuf, plan: ExpressionPlan) -> Self {
         Self::from_roots(vec![root], plan)
@@ -100,11 +122,23 @@ pub fn run_search(config: &SearchConfig) -> Result<SearchReport> {
 }
 
 fn run_search_inner(config: &SearchConfig) -> Result<SearchReport> {
+    let roots = partition_roots(config);
+    if should_stream_stats_only(config, &roots) {
+        let resolved_threads = config.threads.unwrap_or_else(auto_threads_for_streaming);
+        if resolved_threads > 1 {
+            return run_search_streaming_stats_only(config, roots, resolved_threads);
+        }
+    }
+
+    run_search_materialized(config, roots)
+}
+
+fn run_search_materialized(config: &SearchConfig, roots: RootTargets) -> Result<SearchReport> {
     let total_started = Instant::now();
     let mut stats = SearchStats::default();
     let mut hits = Vec::new();
     let discover_started = Instant::now();
-    let discovery = discover_files(config)?;
+    let discovery = discover_files_from_targets(config, roots)?;
     stats.timings.discover_ms = discover_started.elapsed().as_secs_f64() * 1_000.0;
     stats.input_roots = discovery.telemetry.input_roots;
     stats.effective_roots = discovery.telemetry.effective_roots;
@@ -151,10 +185,19 @@ fn run_search_inner(config: &SearchConfig) -> Result<SearchReport> {
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn discover_files(config: &SearchConfig) -> Result<DiscoveryResult> {
     let roots = partition_roots(config);
+    discover_files_from_targets(config, roots)
+}
+
+fn discover_files_from_targets(
+    config: &SearchConfig,
+    roots: RootTargets,
+) -> Result<DiscoveryResult> {
     if roots.directory_roots.is_empty() {
-        let files = finalize_discovered_files(roots.direct_files, roots.telemetry.effective_roots > 1);
+        let files =
+            finalize_discovered_files(roots.direct_files, roots.telemetry.effective_roots > 1);
         return Ok(DiscoveryResult {
             files: files.files,
             telemetry: DiscoveryTelemetry {
@@ -175,6 +218,10 @@ fn discover_files(config: &SearchConfig) -> Result<DiscoveryResult> {
             ..roots.telemetry
         },
     })
+}
+
+fn should_stream_stats_only(config: &SearchConfig, roots: &RootTargets) -> bool {
+    !config.collect_hits && !roots.directory_roots.is_empty()
 }
 
 fn build_walk_builder(config: &SearchConfig, roots: &[PathBuf]) -> WalkBuilder {
@@ -342,7 +389,8 @@ fn classify_root(index: usize, path: &Path) -> NormalizedRoot {
 }
 
 fn has_prior_duplicate(candidate: &NormalizedRoot, roots: &[NormalizedRoot]) -> bool {
-    roots.iter()
+    roots
+        .iter()
         .filter(|other| other.index < candidate.index)
         .any(|other| roots_equivalent(candidate, other))
 }
@@ -394,6 +442,186 @@ fn auto_threads_for_shape(file_count: usize) -> usize {
         16
     };
     available.min(desired).max(1)
+}
+
+fn auto_threads_for_streaming() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_STREAMING_SCAN_THREADS)
+        .max(1)
+}
+
+fn run_search_streaming_stats_only(
+    config: &SearchConfig,
+    roots: RootTargets,
+    resolved_threads: usize,
+) -> Result<SearchReport> {
+    let total_started = Instant::now();
+    let mut stats = SearchStats::default();
+    let hits = Vec::new();
+    let streaming = scan_paths_streaming_stats_only(config, &roots, resolved_threads)?;
+
+    stats.input_roots = roots.telemetry.input_roots;
+    stats.effective_roots = roots.telemetry.effective_roots;
+    stats.pruned_roots = roots.telemetry.pruned_roots;
+    stats.overlap_pruned_roots = roots.telemetry.overlap_pruned_roots;
+    stats.discovered_duplicate_paths = streaming.duplicate_paths;
+    stats.files_discovered = streaming.files_discovered;
+    stats.timings.discover_ms = streaming.discover_ms;
+    stats.timings.scan_ms = streaming.scan_ms;
+
+    let aggregate_started = Instant::now();
+    let mut ignored_hits = Vec::new();
+    for outcome in streaming.outcomes {
+        merge_outcome(&mut stats, &mut ignored_hits, false, outcome);
+    }
+    stats.timings.aggregate_ms = aggregate_started.elapsed().as_secs_f64() * 1_000.0;
+    stats.timings.total_ms = total_started.elapsed().as_secs_f64() * 1_000.0;
+
+    Ok(SearchReport {
+        expression: config.plan.source.clone(),
+        hits,
+        stats,
+    })
+}
+
+fn scan_paths_streaming_stats_only(
+    config: &SearchConfig,
+    roots: &RootTargets,
+    resolved_threads: usize,
+) -> Result<StreamingScanResult> {
+    let queue_depth = resolved_threads
+        .saturating_mul(STREAMING_PATH_QUEUE_MULTIPLIER)
+        .max(1);
+    let (path_sender, path_receiver) = mpsc::sync_channel::<PathBuf>(queue_depth);
+    let (outcome_sender, outcome_receiver) = mpsc::channel::<FileScanOutcome>();
+    let receiver = Arc::new(Mutex::new(path_receiver));
+    let plan = Arc::new(config.plan.clone());
+    let dispatch = DiscoveryDispatch::new(path_sender, roots.telemetry.effective_roots > 1);
+    let files_discovered = Arc::clone(&dispatch.files_discovered);
+    let duplicate_paths = Arc::clone(&dispatch.duplicate_paths);
+    let scan_started = Instant::now();
+
+    let (discover_ms, outcomes) =
+        std::thread::scope(move |scope| -> Result<(f64, Vec<FileScanOutcome>)> {
+            let producer_dispatch = dispatch;
+            for _ in 0..resolved_threads {
+                let receiver = Arc::clone(&receiver);
+                let outcome_sender = outcome_sender.clone();
+                let plan = Arc::clone(&plan);
+                scope.spawn(move || {
+                    worker_scan_loop(receiver, outcome_sender, plan, resolved_threads);
+                });
+            }
+            drop(outcome_sender);
+
+            let discover_started = Instant::now();
+            for path in &roots.direct_files {
+                if !producer_dispatch.submit(path.clone()) {
+                    break;
+                }
+            }
+            discover_files_streaming(config, &roots.directory_roots, &producer_dispatch);
+            let discover_ms = discover_started.elapsed().as_secs_f64() * 1_000.0;
+            drop(producer_dispatch);
+
+            let mut outcomes = Vec::new();
+            for outcome in outcome_receiver {
+                outcomes.push(outcome);
+            }
+
+            Ok((discover_ms, outcomes))
+        })?;
+
+    Ok(StreamingScanResult {
+        outcomes,
+        files_discovered: files_discovered.load(Ordering::Relaxed),
+        duplicate_paths: duplicate_paths.load(Ordering::Relaxed),
+        discover_ms,
+        scan_ms: scan_started.elapsed().as_secs_f64() * 1_000.0,
+    })
+}
+
+fn discover_files_streaming(
+    config: &SearchConfig,
+    roots: &[PathBuf],
+    dispatch: &DiscoveryDispatch,
+) {
+    let builder = build_walk_builder(config, roots);
+    let walker = builder.build_parallel();
+    walker.run(|| {
+        let dispatch = dispatch.clone();
+        Box::new(move |result| {
+            if let Ok(entry) = result {
+                if entry.file_type().is_some_and(|kind| kind.is_file())
+                    && !dispatch.submit(entry.into_path())
+                {
+                    return WalkState::Quit;
+                }
+            }
+            WalkState::Continue
+        })
+    });
+}
+
+fn worker_scan_loop(
+    receiver: Arc<Mutex<mpsc::Receiver<PathBuf>>>,
+    sender: mpsc::Sender<FileScanOutcome>,
+    plan: Arc<ExpressionPlan>,
+    resolved_threads: usize,
+) {
+    loop {
+        let received = {
+            let receiver = receiver
+                .lock()
+                .expect("streaming path receiver should not be poisoned");
+            receiver.recv()
+        };
+        let path = match received {
+            Ok(path) => path,
+            Err(_) => break,
+        };
+        if sender
+            .send(scan_file(&path, plan.as_ref(), false, resolved_threads))
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+impl DiscoveryDispatch {
+    fn new(sender: mpsc::SyncSender<PathBuf>, dedupe: bool) -> Self {
+        Self {
+            sender,
+            seen: dedupe.then(|| Arc::new(Mutex::new(BTreeSet::new()))),
+            files_discovered: Arc::new(AtomicUsize::new(0)),
+            duplicate_paths: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn submit(&self, path: PathBuf) -> bool {
+        if let Some(seen) = &self.seen {
+            let is_new = {
+                let mut seen = seen
+                    .lock()
+                    .expect("streaming discovery set should not be poisoned");
+                seen.insert(path.clone())
+            };
+            if !is_new {
+                self.duplicate_paths.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+
+        if self.sender.send(path).is_ok() {
+            self.files_discovered.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn scan_paths(
@@ -926,6 +1154,81 @@ mod tests {
         assert_eq!(report.stats.effective_roots, 2);
         assert_eq!(report.stats.pruned_roots, 0);
         assert_eq!(report.stats.overlap_pruned_roots, 0);
+        assert_eq!(report.stats.discovered_duplicate_paths, 0);
+        assert_eq!(report.stats.acceleration_bailouts, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_search_stats_only_streams_single_directory_root_without_changing_totals() {
+        let root = unique_temp_path("iex-engine-search-stats-only");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        fs::write(root.join("one.txt"), "alpha\nneedle here\n")
+            .expect("first fixture should write");
+        fs::write(root.join("two.txt"), "needle again\nbeta\n")
+            .expect("second fixture should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let collecting = run_search(&SearchConfig::new(root.clone(), plan.clone()))
+            .expect("collecting search should succeed");
+
+        let mut stats_only_config = SearchConfig::new(root.clone(), plan);
+        stats_only_config.collect_hits = false;
+        let stats_only = run_search(&stats_only_config).expect("stats-only search should succeed");
+
+        assert!(stats_only.hits.is_empty());
+        assert_eq!(
+            stats_only.stats.files_discovered,
+            collecting.stats.files_discovered
+        );
+        assert_eq!(
+            stats_only.stats.files_scanned,
+            collecting.stats.files_scanned
+        );
+        assert_eq!(
+            stats_only.stats.files_skipped,
+            collecting.stats.files_skipped
+        );
+        assert_eq!(
+            stats_only.stats.matches_found,
+            collecting.stats.matches_found
+        );
+        assert_eq!(
+            stats_only.stats.bytes_scanned,
+            collecting.stats.bytes_scanned
+        );
+        assert_eq!(stats_only.stats.input_roots, 1);
+        assert_eq!(stats_only.stats.effective_roots, 1);
+        assert_eq!(stats_only.stats.pruned_roots, 0);
+        assert_eq!(stats_only.stats.overlap_pruned_roots, 0);
+        assert_eq!(stats_only.stats.discovered_duplicate_paths, 0);
+        assert_eq!(stats_only.stats.acceleration_bailouts, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_search_stats_only_preserves_overlap_pruning_for_mixed_roots() {
+        let root = unique_temp_path("iex-engine-search-overlap-stats-only");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        let file = root.join("needle.txt");
+        fs::write(&file, "needle here\n").expect("fixture file should write");
+
+        let plan = ExpressionPlan::parse("lit:needle").expect("plan should parse");
+        let mut config = SearchConfig::from_roots(vec![root.clone(), file.clone()], plan);
+        config.collect_hits = false;
+        let report = run_search(&config).expect("stats-only overlap search should succeed");
+
+        assert!(report.hits.is_empty());
+        assert_eq!(report.stats.files_discovered, 1);
+        assert_eq!(report.stats.files_scanned, 1);
+        assert_eq!(report.stats.files_skipped, 0);
+        assert_eq!(report.stats.matches_found, 1);
+        assert_eq!(report.stats.input_roots, 2);
+        assert_eq!(report.stats.effective_roots, 1);
+        assert_eq!(report.stats.pruned_roots, 1);
+        assert_eq!(report.stats.overlap_pruned_roots, 1);
         assert_eq!(report.stats.discovered_duplicate_paths, 0);
         assert_eq!(report.stats.acceleration_bailouts, 0);
 

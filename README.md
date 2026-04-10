@@ -125,6 +125,7 @@ Cross-build note: a macOS binary cannot be linked from this Windows machine by R
 - Dashboard provenance: the live monitor summarizes `tools/reports/live-metrics.jsonl` and separately surfaces the latest `ripgrep-benchsuite-*.csv` artifact so benchsuite refresh status stays visible beside the live diagnostics feed.
 - Canonical performance measurement is the ripgrep benchsuite raw artifact plus the live iEx diagnostics window; the live diagnostics harness remains available for instrumentation and tuning.
 - Benchmark scripts accept `--iex-binary <path>` for explicit baseline/candidate replays; when supplied, the runner uses that immutable binary path instead of rebuilding `target/release/iex-cli.exe`.
+- Supported benchmark build profiles are `debug`, `release`, and `release-lto`; `release-lto` is the first canonical single-root proof candidate for binary-layout work.
 - Metric model:
   - `iexMs`: iEx core engine time (`report.stats.timings.total_ms`)
   - `iexCliMs`: full CLI wall-clock time (startup + parse + engine + output)
@@ -149,4 +150,4 @@ Current benchmark truth must always come from the latest generated report artifa
 
 ## Agent and operator usage rule
 
-Once native install is present, prefer `iex` for local search, search validation, and operator workflows in this repo. Use `rg` for repo archaeology when the task is not validating iEx behavior itself or when the native install has not been activated in the current shell yet.
+Once native install is present, prefer `iex` for local search, search validation, and operator workflows in this repo.
