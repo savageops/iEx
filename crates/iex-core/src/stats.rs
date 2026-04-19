@@ -18,6 +18,33 @@ pub struct SlowFileStat {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ConcurrencyStats {
+    pub available_threads: usize,
+    pub outer_scan_threads: usize,
+    pub execution_mode: String,
+    pub sharding_enabled: bool,
+    pub sharded_files: usize,
+    pub max_shard_threads: usize,
+    pub max_shard_ranges: usize,
+    pub max_shard_chunk_bytes: usize,
+}
+
+impl Default for ConcurrencyStats {
+    fn default() -> Self {
+        Self {
+            available_threads: 0,
+            outer_scan_threads: 0,
+            execution_mode: String::new(),
+            sharding_enabled: false,
+            sharded_files: 0,
+            max_shard_threads: 0,
+            max_shard_ranges: 0,
+            max_shard_chunk_bytes: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchStats {
     pub input_roots: usize,
     pub effective_roots: usize,
@@ -31,6 +58,7 @@ pub struct SearchStats {
     pub matches_found: usize,
     pub bytes_scanned: u64,
     pub timings: PhaseTimings,
+    pub concurrency: ConcurrencyStats,
     pub slowest_files: Vec<SlowFileStat>,
 }
 
@@ -49,12 +77,39 @@ impl Default for SearchStats {
             matches_found: 0,
             bytes_scanned: 0,
             timings: PhaseTimings::default(),
+            concurrency: ConcurrencyStats::default(),
             slowest_files: Vec::new(),
         }
     }
 }
 
 impl SearchStats {
+    pub fn set_concurrency_context(
+        &mut self,
+        available_threads: usize,
+        outer_scan_threads: usize,
+        execution_mode: &str,
+    ) {
+        self.concurrency.available_threads = available_threads;
+        self.concurrency.outer_scan_threads = outer_scan_threads;
+        self.concurrency.execution_mode.clear();
+        self.concurrency.execution_mode.push_str(execution_mode);
+    }
+
+    pub fn observe_parallel_sharding(
+        &mut self,
+        shard_threads: usize,
+        range_count: usize,
+        chunk_bytes: usize,
+    ) {
+        self.concurrency.sharding_enabled = true;
+        self.concurrency.sharded_files += 1;
+        self.concurrency.max_shard_threads = self.concurrency.max_shard_threads.max(shard_threads);
+        self.concurrency.max_shard_ranges = self.concurrency.max_shard_ranges.max(range_count);
+        self.concurrency.max_shard_chunk_bytes =
+            self.concurrency.max_shard_chunk_bytes.max(chunk_bytes);
+    }
+
     pub fn consider_slow_file(&mut self, path: &Path, duration_ms: f64, bytes: u64) {
         if self.slowest_files.len() == 5 {
             if let Some(current_slowest) = self.slowest_files.last() {

@@ -97,7 +97,10 @@ impl RejectFastGate {
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
-        let literals: Vec<Vec<u8>> = literals.into_iter().map(|literal| literal.to_vec()).collect();
+        let literals: Vec<Vec<u8>> = literals
+            .into_iter()
+            .map(|literal| literal.to_vec())
+            .collect();
         if literals.is_empty()
             || literals
                 .iter()
@@ -157,7 +160,10 @@ impl AsciiCaseFoldSearcher {
             return None;
         }
 
-        let folded: Vec<u8> = needle.iter().map(|byte| byte.to_ascii_lowercase()).collect();
+        let folded: Vec<u8> = needle
+            .iter()
+            .map(|byte| byte.to_ascii_lowercase())
+            .collect();
         let mut shift = [folded.len(); 256];
 
         if folded.len() > 1 {
@@ -178,12 +184,7 @@ impl AsciiCaseFoldSearcher {
         self.needle.len()
     }
 
-    fn matches_at_anchor(
-        &self,
-        haystack: &[u8],
-        start: usize,
-        anchor: LiteralAnchorPlan,
-    ) -> bool {
+    fn matches_at_anchor(&self, haystack: &[u8], start: usize, anchor: LiteralAnchorPlan) -> bool {
         let needle_len = self.needle.len();
         if start + needle_len > haystack.len()
             || !ascii_casefold_eq(haystack[start + anchor.offset], self.needle[anchor.offset])
@@ -346,6 +347,20 @@ impl ExpressionPlan {
         true
     }
 
+    pub fn supports_outer_parallel_shard_fast_count(&self) -> bool {
+        !matches!(
+            self.compiled.as_slice(),
+            [Predicate::Regex {
+                fast_path: Some(
+                    RegexFastPath::LiteralAlternates { .. }
+                        | RegexFastPath::WordBoundaryLiteral { .. }
+                        | RegexFastPath::AsciiCaseFoldWordBoundaryLiteral { .. }
+                ),
+                ..
+            }]
+        )
+    }
+
     pub fn matches_bytes(&self, haystack: &[u8]) -> bool {
         match self.mode {
             LogicMode::All => self
@@ -438,15 +453,15 @@ impl ExpressionPlan {
 
         match self.compiled.as_slice() {
             [Predicate::Regex { fast_path, .. }] => match fast_path {
-                Some(RegexFastPath::PlainLiteral { needle_len, finder, .. }) => {
-                    Some(count_literal_occurrences_bytes_in_range(
-                        haystack,
-                        finder,
-                        *needle_len,
-                        start,
-                        bounded_end,
-                    ))
-                }
+                Some(RegexFastPath::PlainLiteral {
+                    needle_len, finder, ..
+                }) => Some(count_literal_occurrences_bytes_in_range(
+                    haystack,
+                    finder,
+                    *needle_len,
+                    start,
+                    bounded_end,
+                )),
                 Some(RegexFastPath::AsciiCaseFoldLiteral { searcher, .. }) => {
                     Some(count_casefold_literal_occurrences_bytes_in_range(
                         haystack,
@@ -464,25 +479,25 @@ impl ExpressionPlan {
                         bounded_end,
                     ))
                 }
-                Some(RegexFastPath::AsciiCaseFoldWordBoundaryLiteral { searcher }) => {
-                    Some(count_casefold_word_boundary_literal_occurrences_bytes_in_range(
-                    haystack,
-                    searcher,
-                    start,
-                    bounded_end,
-                ))
-                }
+                Some(RegexFastPath::AsciiCaseFoldWordBoundaryLiteral { searcher }) => Some(
+                    count_casefold_word_boundary_literal_occurrences_bytes_in_range(
+                        haystack,
+                        searcher,
+                        start,
+                        bounded_end,
+                    ),
+                ),
                 Some(RegexFastPath::LiteralAlternates {
                     automaton,
                     max_literal_len,
                     ..
                 }) => Some(count_alternate_literal_occurrences_bytes_in_range(
-                        haystack,
-                        automaton,
-                        *max_literal_len,
-                        start,
-                        bounded_end,
-                    )),
+                    haystack,
+                    automaton,
+                    *max_literal_len,
+                    start,
+                    bounded_end,
+                )),
                 None => None,
             },
             [Predicate::Literal { bytes, finder, .. }] => {
@@ -497,7 +512,6 @@ impl ExpressionPlan {
             _ => None,
         }
     }
-
 }
 
 fn parse_token(token: &str) -> Result<(Predicate, PredicateDescriptor)> {
@@ -677,8 +691,10 @@ fn classify_regex_fast_path(pattern: &str) -> Option<RegexFastPath> {
         .map(|part| part.into_bytes())
         .collect();
     let max_literal_len = literals.iter().map(Vec::len).max()?;
-    let reject_fast =
-        RejectFastGate::from_literals(literals.iter().map(|part| part.as_slice()), case_insensitive);
+    let reject_fast = RejectFastGate::from_literals(
+        literals.iter().map(|part| part.as_slice()),
+        case_insensitive,
+    );
     let automaton = build_literal_automaton(literals, case_insensitive)?;
     Some(RegexFastPath::LiteralAlternates {
         automaton,
@@ -780,7 +796,11 @@ fn best_literal_anchor_plan(needle: &[u8]) -> Option<LiteralAnchorPlan> {
         .map(|(offset, byte)| {
             let duplicate_penalty = counts[byte as usize].saturating_sub(1) as u16;
             let rank = ascii_anchor_frequency_rank(byte) as u16;
-            let poison_penalty = if is_poisonous_anchor_byte(byte) { 1u16 } else { 0u16 };
+            let poison_penalty = if is_poisonous_anchor_byte(byte) {
+                1u16
+            } else {
+                0u16
+            };
             let edge_penalty = if offset == 0 || offset + 1 == needle.len() {
                 1u16
             } else {
@@ -1134,9 +1154,7 @@ mod tests {
     fn reject_fast_enabled(plan: &ExpressionPlan) -> bool {
         match regex_fast_path(plan) {
             Some(RegexFastPath::PlainLiteral { reject_fast, .. }) => reject_fast.is_some(),
-            Some(RegexFastPath::AsciiCaseFoldLiteral { reject_fast, .. }) => {
-                reject_fast.is_some()
-            }
+            Some(RegexFastPath::AsciiCaseFoldLiteral { reject_fast, .. }) => reject_fast.is_some(),
             Some(RegexFastPath::LiteralAlternates { reject_fast, .. }) => reject_fast.is_some(),
             _ => false,
         }
@@ -1145,12 +1163,28 @@ mod tests {
     fn reject_fast_gate(plan: &ExpressionPlan) -> Option<&super::RejectFastGate> {
         match regex_fast_path(plan) {
             Some(RegexFastPath::PlainLiteral { reject_fast, .. }) => reject_fast.as_ref(),
-            Some(RegexFastPath::AsciiCaseFoldLiteral { reject_fast, .. }) => {
-                reject_fast.as_ref()
-            }
+            Some(RegexFastPath::AsciiCaseFoldLiteral { reject_fast, .. }) => reject_fast.as_ref(),
             Some(RegexFastPath::LiteralAlternates { reject_fast, .. }) => reject_fast.as_ref(),
             _ => None,
         }
+    }
+
+    #[test]
+    fn alternates_plan_disables_outer_parallel_shard_fast_count() {
+        let plan = ExpressionPlan::parse(r"re:(ERR_SYS|PME_TURN_OFF)").expect("plan should parse");
+        assert!(!plan.supports_outer_parallel_shard_fast_count());
+    }
+
+    #[test]
+    fn word_boundary_plan_disables_outer_parallel_shard_fast_count() {
+        let plan = ExpressionPlan::parse(r"re:\bPM_RESUME\b").expect("plan should parse");
+        assert!(!plan.supports_outer_parallel_shard_fast_count());
+    }
+
+    #[test]
+    fn plain_literal_plan_keeps_outer_parallel_shard_fast_count() {
+        let plan = ExpressionPlan::parse(r"re:PM_RESUME").expect("plan should parse");
+        assert!(plan.supports_outer_parallel_shard_fast_count());
     }
 
     #[test]
@@ -1276,9 +1310,8 @@ mod tests {
 
     #[test]
     fn alternates_fast_path_enables_reject_fast_for_long_ascii_literals() {
-        let plan =
-            ExpressionPlan::parse(r"re:(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)")
-                .expect("plan should parse");
+        let plan = ExpressionPlan::parse(r"re:(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)")
+            .expect("plan should parse");
         assert!(matches!(
             regex_fast_path(&plan),
             Some(RegexFastPath::LiteralAlternates { .. })

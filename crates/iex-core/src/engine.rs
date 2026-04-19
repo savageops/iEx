@@ -23,12 +23,12 @@ use crate::{expr::ExpressionPlan, stats::SearchStats};
 const TINY_FILE_INLINE_LIMIT: usize = 16 * 1024;
 const SMALL_FILE_INLINE_LIMIT: u64 = 256 * 1024;
 const BINARY_SNIFF_LIMIT: usize = 1024;
-const PARALLEL_FAST_COUNT_FILE_THRESHOLD: usize = 64 * 1024 * 1024;
-const PARALLEL_FAST_COUNT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
-const MAX_PARALLEL_FAST_COUNT_THREADS: usize = 12;
+const PARALLEL_FAST_COUNT_FILE_THRESHOLD: usize = 16 * 1024 * 1024;
+const PARALLEL_FAST_COUNT_MEDIUM_MIN_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const PARALLEL_FAST_COUNT_DOMINANT_MIN_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+const PARALLEL_FAST_COUNT_TARGET_RANGES_PER_THREAD: usize = 2;
 const DOMINANT_FILE_PARALLEL_THRESHOLD: usize = 512 * 1024 * 1024;
-const DOMINANT_FILE_PARALLEL_THREAD_CAP: usize = 4;
-const MAX_STREAMING_SCAN_THREADS: usize = 12;
+const DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX: usize = 12;
 const STREAMING_PATH_QUEUE_MULTIPLIER: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -65,6 +65,7 @@ struct FileScanOutcome {
     hits: Vec<SearchHit>,
     match_count: usize,
     scanned: bool,
+    shard_plan: Option<ParallelShardPlan>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -89,6 +90,88 @@ struct StreamingScanResult {
     duplicate_paths: usize,
     discover_ms: f64,
     scan_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionMode {
+    Materialized,
+    StreamingStatsOnly,
+}
+
+impl ExecutionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Materialized => "materialized",
+            Self::StreamingStatsOnly => "streaming_stats_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RunConcurrencyPlan {
+    available_threads: usize,
+    outer_scan_threads: usize,
+    execution_mode: ExecutionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParallelShardPlan {
+    shard_threads: usize,
+    chunk_bytes: usize,
+    range_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConcurrencyPlanner {
+    available_threads: usize,
+}
+
+impl ConcurrencyPlanner {
+    fn detect() -> Self {
+        Self {
+            available_threads: available_threads(),
+        }
+    }
+
+    fn plan_materialized(
+        self,
+        requested_threads: Option<usize>,
+        file_count: usize,
+    ) -> RunConcurrencyPlan {
+        let outer_scan_threads = requested_threads
+            .map(|threads| threads.max(1))
+            .unwrap_or_else(|| {
+                auto_threads_for_shape_with_available(file_count, self.available_threads)
+            });
+        RunConcurrencyPlan {
+            available_threads: self.available_threads,
+            outer_scan_threads,
+            execution_mode: ExecutionMode::Materialized,
+        }
+    }
+
+    fn plan_streaming(self, requested_threads: Option<usize>) -> RunConcurrencyPlan {
+        let outer_scan_threads = requested_threads
+            .map(|threads| threads.max(1))
+            .unwrap_or_else(|| auto_threads_for_streaming_with_available(self.available_threads));
+        RunConcurrencyPlan {
+            available_threads: self.available_threads,
+            outer_scan_threads,
+            execution_mode: ExecutionMode::StreamingStatsOnly,
+        }
+    }
+
+    fn plan_parallel_fast_count(
+        self,
+        file_len: usize,
+        outer_scan_threads: usize,
+    ) -> Option<ParallelShardPlan> {
+        parallel_fast_count_plan_with_available(
+            file_len,
+            outer_scan_threads,
+            self.available_threads,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -125,18 +208,23 @@ pub fn run_search(config: &SearchConfig) -> Result<SearchReport> {
 }
 
 fn run_search_inner(config: &SearchConfig) -> Result<SearchReport> {
+    let concurrency = ConcurrencyPlanner::detect();
     let roots = partition_roots(config);
     if should_stream_stats_only(config, &roots) {
-        let resolved_threads = config.threads.unwrap_or_else(auto_threads_for_streaming);
-        if resolved_threads > 1 {
-            return run_search_streaming_stats_only(config, roots, resolved_threads);
+        let run_plan = concurrency.plan_streaming(config.threads);
+        if run_plan.outer_scan_threads > 1 {
+            return run_search_streaming_stats_only(config, roots, concurrency, run_plan);
         }
     }
 
-    run_search_materialized(config, roots)
+    run_search_materialized(config, roots, concurrency)
 }
 
-fn run_search_materialized(config: &SearchConfig, roots: RootTargets) -> Result<SearchReport> {
+fn run_search_materialized(
+    config: &SearchConfig,
+    roots: RootTargets,
+    concurrency: ConcurrencyPlanner,
+) -> Result<SearchReport> {
     let total_started = Instant::now();
     let mut stats = SearchStats::default();
     let mut hits = Vec::new();
@@ -150,15 +238,19 @@ fn run_search_materialized(config: &SearchConfig, roots: RootTargets) -> Result<
     stats.discovered_duplicate_paths = discovery.telemetry.discovered_duplicate_paths;
     stats.files_discovered = discovery.files.len();
 
-    let resolved_threads = config
-        .threads
-        .unwrap_or_else(|| auto_threads_for_shape(discovery.files.len()));
+    let run_plan = concurrency.plan_materialized(config.threads, discovery.files.len());
+    stats.set_concurrency_context(
+        run_plan.available_threads,
+        run_plan.outer_scan_threads,
+        run_plan.execution_mode.as_str(),
+    );
     let scan_started = Instant::now();
     let mut outcomes = scan_paths(
         &discovery.files,
         &config.plan,
         config.collect_hits,
-        resolved_threads,
+        concurrency,
+        run_plan.outer_scan_threads,
     )?;
     stats.timings.scan_ms = scan_started.elapsed().as_secs_f64() * 1_000.0;
 
@@ -224,7 +316,7 @@ fn discover_files_from_targets(
 }
 
 fn should_stream_stats_only(config: &SearchConfig, roots: &RootTargets) -> bool {
-    !config.collect_hits && !roots.directory_roots.is_empty() && roots.telemetry.input_roots > 1
+    !config.collect_hits && !roots.directory_roots.is_empty()
 }
 
 fn build_walk_builder(config: &SearchConfig, roots: &[PathBuf]) -> WalkBuilder {
@@ -428,42 +520,69 @@ fn comparable_root_path(root: &NormalizedRoot) -> &Path {
     root.canonical.as_deref().unwrap_or(root.path.as_path())
 }
 
-fn auto_threads_for_shape(file_count: usize) -> usize {
-    let available = std::thread::available_parallelism()
+fn available_threads() -> usize {
+    std::thread::available_parallelism()
         .map(usize::from)
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn threads_90pct(available: usize) -> usize {
+    // ceil(available * 0.9) without floats
+    // (available * 9 + 9) / 10 is ceil for positive integers.
+    let available = available.max(1);
+    let desired = (available.saturating_mul(9).saturating_add(9)) / 10;
+    desired.clamp(1, available)
+}
+
+fn dominant_parallel_thread_cap(shard_budget: usize) -> usize {
+    (shard_budget / 4)
+        .max(4)
+        .min(DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX)
+        .max(1)
+}
+
+#[allow(dead_code)]
+fn auto_threads_for_shape(file_count: usize) -> usize {
+    auto_threads_for_shape_with_available(file_count, available_threads())
+}
+
+fn auto_threads_for_shape_with_available(file_count: usize, available: usize) -> usize {
+    let available = available.max(1);
 
     let desired = if file_count <= 24 {
         1
     } else if file_count <= 128 {
         4
-    } else if file_count <= 1_024 {
+    } else if file_count < 1_024 {
         8
-    } else if file_count <= 8_192 {
-        12
     } else {
-        16
+        threads_90pct(available)
     };
+
     available.min(desired).max(1)
 }
 
+#[allow(dead_code)]
 fn auto_threads_for_streaming() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(MAX_STREAMING_SCAN_THREADS)
-        .max(1)
+    auto_threads_for_streaming_with_available(available_threads())
+}
+
+fn auto_threads_for_streaming_with_available(available: usize) -> usize {
+    threads_90pct(available.max(1))
 }
 
 fn run_search_streaming_stats_only(
     config: &SearchConfig,
     roots: RootTargets,
-    resolved_threads: usize,
+    concurrency: ConcurrencyPlanner,
+    run_plan: RunConcurrencyPlan,
 ) -> Result<SearchReport> {
     let total_started = Instant::now();
     let mut stats = SearchStats::default();
     let hits = Vec::new();
-    let streaming = scan_paths_streaming_stats_only(config, &roots, resolved_threads)?;
+    let streaming =
+        scan_paths_streaming_stats_only(config, &roots, concurrency, run_plan.outer_scan_threads)?;
 
     stats.input_roots = roots.telemetry.input_roots;
     stats.effective_roots = roots.telemetry.effective_roots;
@@ -473,6 +592,11 @@ fn run_search_streaming_stats_only(
     stats.files_discovered = streaming.files_discovered;
     stats.timings.discover_ms = streaming.discover_ms;
     stats.timings.scan_ms = streaming.scan_ms;
+    stats.set_concurrency_context(
+        run_plan.available_threads,
+        run_plan.outer_scan_threads,
+        run_plan.execution_mode.as_str(),
+    );
 
     let aggregate_started = Instant::now();
     let mut ignored_hits = Vec::new();
@@ -492,6 +616,7 @@ fn run_search_streaming_stats_only(
 fn scan_paths_streaming_stats_only(
     config: &SearchConfig,
     roots: &RootTargets,
+    concurrency: ConcurrencyPlanner,
     resolved_threads: usize,
 ) -> Result<StreamingScanResult> {
     let queue_depth = resolved_threads
@@ -512,8 +637,15 @@ fn scan_paths_streaming_stats_only(
                 let receiver = path_receiver.clone();
                 let outcome_sender = outcome_sender.clone();
                 let plan = Arc::clone(&plan);
+                let concurrency = concurrency;
                 scope.spawn(move || {
-                    worker_scan_loop(receiver, outcome_sender, plan, resolved_threads);
+                    worker_scan_loop(
+                        receiver,
+                        outcome_sender,
+                        plan,
+                        concurrency,
+                        resolved_threads,
+                    );
                 });
             }
             drop(path_receiver);
@@ -572,6 +704,7 @@ fn worker_scan_loop(
     receiver: channel::Receiver<PathBuf>,
     sender: channel::Sender<FileScanOutcome>,
     plan: Arc<ExpressionPlan>,
+    concurrency: ConcurrencyPlanner,
     resolved_threads: usize,
 ) {
     loop {
@@ -580,7 +713,13 @@ fn worker_scan_loop(
             Err(_) => break,
         };
         if sender
-            .send(scan_file(&path, plan.as_ref(), false, resolved_threads))
+            .send(scan_file(
+                &path,
+                plan.as_ref(),
+                false,
+                concurrency,
+                resolved_threads,
+            ))
             .is_err()
         {
             break;
@@ -625,12 +764,13 @@ fn scan_paths(
     files: &[PathBuf],
     plan: &ExpressionPlan,
     collect_hits: bool,
+    concurrency: ConcurrencyPlanner,
     resolved_threads: usize,
 ) -> Result<Vec<FileScanOutcome>> {
     if resolved_threads <= 1 {
         return Ok(files
             .iter()
-            .map(|path| scan_file(path, plan, collect_hits, resolved_threads))
+            .map(|path| scan_file(path, plan, collect_hits, concurrency, resolved_threads))
             .collect());
     }
 
@@ -641,7 +781,7 @@ fn scan_paths(
     Ok(pool.install(|| {
         files
             .par_iter()
-            .map(|path| scan_file(path, plan, collect_hits, resolved_threads))
+            .map(|path| scan_file(path, plan, collect_hits, concurrency, resolved_threads))
             .collect()
     }))
 }
@@ -657,6 +797,13 @@ fn merge_outcome(
         stats.bytes_scanned += outcome.bytes;
         stats.consider_slow_file(&outcome.path, outcome.duration_ms, outcome.bytes);
         stats.matches_found += outcome.match_count;
+        if let Some(shard_plan) = outcome.shard_plan {
+            stats.observe_parallel_sharding(
+                shard_plan.shard_threads,
+                shard_plan.range_count,
+                shard_plan.chunk_bytes,
+            );
+        }
         if collect_hits {
             hits.extend(outcome.hits);
         }
@@ -669,7 +816,8 @@ fn scan_file(
     path: &Path,
     plan: &ExpressionPlan,
     collect_hits: bool,
-    thread_budget: usize,
+    concurrency: ConcurrencyPlanner,
+    outer_scan_threads: usize,
 ) -> FileScanOutcome {
     let started = Instant::now();
     let mut outcome = {
@@ -689,7 +837,8 @@ fn scan_file(
                 path,
                 plan,
                 collect_hits,
-                thread_budget,
+                concurrency,
+                outer_scan_threads,
                 &tiny[..tiny_read],
                 tiny_read as u64,
             )
@@ -705,7 +854,8 @@ fn scan_file(
                     path,
                     plan,
                     collect_hits,
-                    thread_budget,
+                    concurrency,
+                    outer_scan_threads,
                     &tiny,
                     tiny.len() as u64,
                 )
@@ -726,7 +876,8 @@ fn scan_file(
                         path,
                         plan,
                         collect_hits,
-                        thread_budget,
+                        concurrency,
+                        outer_scan_threads,
                         &bytes,
                         metadata.len(),
                     )
@@ -739,7 +890,8 @@ fn scan_file(
                         path,
                         plan,
                         collect_hits,
-                        thread_budget,
+                        concurrency,
+                        outer_scan_threads,
                         &mmap,
                         metadata.len(),
                     )
@@ -755,7 +907,8 @@ fn scan_loaded_bytes(
     path: &Path,
     plan: &ExpressionPlan,
     collect_hits: bool,
-    thread_budget: usize,
+    concurrency: ConcurrencyPlanner,
+    outer_scan_threads: usize,
     bytes: &[u8],
     file_bytes: u64,
 ) -> FileScanOutcome {
@@ -768,13 +921,15 @@ fn scan_loaded_bytes(
     let mut cached_path = None::<String>;
 
     if !collect_hits {
-        if let Some(count) = maybe_parallel_fast_count_bytes(plan, bytes, thread_budget) {
+        if let Some((count, shard_plan)) =
+            maybe_parallel_fast_count_bytes(plan, bytes, concurrency, outer_scan_threads)
+        {
             match_count = count;
-            return completed_outcome(path, file_bytes, hits, match_count);
+            return completed_outcome(path, file_bytes, hits, match_count, Some(shard_plan));
         }
         if let Some(count) = plan.fast_match_count_no_hits_bytes(bytes) {
             match_count = count;
-            return completed_outcome(path, file_bytes, hits, match_count);
+            return completed_outcome(path, file_bytes, hits, match_count, None);
         }
     }
 
@@ -824,7 +979,7 @@ fn scan_loaded_bytes(
         if !collect_hits {
             if let Some(count) = plan.fast_match_count_no_hits(&text) {
                 match_count = count;
-                return completed_outcome(path, file_bytes, hits, match_count);
+                return completed_outcome(path, file_bytes, hits, match_count, None);
             }
         }
 
@@ -846,7 +1001,7 @@ fn scan_loaded_bytes(
         }
     }
 
-    completed_outcome(path, file_bytes, hits, match_count)
+    completed_outcome(path, file_bytes, hits, match_count, None)
 }
 
 fn is_likely_binary(bytes: &[u8]) -> bool {
@@ -857,20 +1012,16 @@ fn is_likely_binary(bytes: &[u8]) -> bool {
 fn maybe_parallel_fast_count_bytes(
     plan: &ExpressionPlan,
     bytes: &[u8],
-    thread_budget: usize,
-) -> Option<usize> {
-    let parallel_threads = parallel_fast_count_threads(bytes.len(), thread_budget)?;
-    let chunk_size = bytes
-        .len()
-        .div_ceil(parallel_threads.saturating_mul(2))
-        .max(PARALLEL_FAST_COUNT_CHUNK_BYTES);
-    let ranges = build_chunk_ranges(bytes.len(), chunk_size);
-    if ranges.len() <= 1 {
+    concurrency: ConcurrencyPlanner,
+    outer_scan_threads: usize,
+) -> Option<(usize, ParallelShardPlan)> {
+    if outer_scan_threads > 1 && !plan.supports_outer_parallel_shard_fast_count() {
         return None;
     }
-
+    let shard_plan = concurrency.plan_parallel_fast_count(bytes.len(), outer_scan_threads)?;
+    let ranges = build_chunk_ranges(bytes.len(), shard_plan.chunk_bytes);
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(parallel_threads)
+        .num_threads(shard_plan.shard_threads)
         .build()
         .ok()?;
     pool.install(|| {
@@ -878,32 +1029,91 @@ fn maybe_parallel_fast_count_bytes(
             .par_iter()
             .map(|(start, end)| plan.fast_match_count_no_hits_bytes_in_range(bytes, *start, *end))
             .collect::<Option<Vec<_>>>()
-            .map(|counts| counts.into_iter().sum())
+            .map(|counts| (counts.into_iter().sum(), shard_plan))
     })
 }
 
-fn parallel_fast_count_threads(file_len: usize, thread_budget: usize) -> Option<usize> {
+fn parallel_fast_count_min_chunk_bytes(file_len: usize) -> usize {
+    if file_len >= DOMINANT_FILE_PARALLEL_THRESHOLD {
+        PARALLEL_FAST_COUNT_DOMINANT_MIN_CHUNK_BYTES
+    } else {
+        PARALLEL_FAST_COUNT_MEDIUM_MIN_CHUNK_BYTES
+    }
+}
+
+#[allow(dead_code)]
+fn parallel_fast_count_plan(
+    file_len: usize,
+    outer_scan_threads: usize,
+) -> Option<ParallelShardPlan> {
+    parallel_fast_count_plan_with_available(file_len, outer_scan_threads, available_threads())
+}
+
+fn parallel_fast_count_plan_with_available(
+    file_len: usize,
+    outer_scan_threads: usize,
+    available: usize,
+) -> Option<ParallelShardPlan> {
     if file_len < PARALLEL_FAST_COUNT_FILE_THRESHOLD {
         return None;
     }
 
-    let available_threads = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(MAX_PARALLEL_FAST_COUNT_THREADS);
-    if available_threads <= 1 {
+    let available = available.max(1);
+    if available <= 1 {
         return None;
     }
 
-    if thread_budget <= 1 {
-        return Some(available_threads);
+    let shard_budget =
+        parallel_fast_count_thread_budget_with_available(file_len, outer_scan_threads, available)?;
+    let min_chunk_bytes = parallel_fast_count_min_chunk_bytes(file_len);
+    let max_range_count = file_len.div_ceil(min_chunk_bytes);
+    if max_range_count <= 1 {
+        return None;
+    }
+
+    let shard_threads = shard_budget.min(max_range_count);
+    if shard_threads <= 1 {
+        return None;
+    }
+
+    let target_range_count = shard_threads
+        .saturating_mul(PARALLEL_FAST_COUNT_TARGET_RANGES_PER_THREAD)
+        .clamp(2, max_range_count);
+    let chunk_bytes = file_len.div_ceil(target_range_count).max(min_chunk_bytes);
+    let range_count = build_chunk_ranges(file_len, chunk_bytes).len();
+    let shard_threads = shard_threads.min(range_count);
+    if shard_threads <= 1 || range_count <= 1 {
+        return None;
+    }
+
+    Some(ParallelShardPlan {
+        shard_threads,
+        chunk_bytes,
+        range_count,
+    })
+}
+
+fn parallel_fast_count_thread_budget_with_available(
+    file_len: usize,
+    outer_scan_threads: usize,
+    available: usize,
+) -> Option<usize> {
+    let shard_budget = threads_90pct(available.max(1));
+
+    if outer_scan_threads <= 1 {
+        return (shard_budget > 1).then_some(shard_budget);
+    }
+
+    if file_len < PARALLEL_FAST_COUNT_FILE_THRESHOLD {
+        return None;
     }
 
     if file_len < DOMINANT_FILE_PARALLEL_THRESHOLD {
-        return None;
+        let medium_threads = shard_budget.min(3);
+        return (medium_threads > 1).then_some(medium_threads);
     }
 
-    let dominant_threads = available_threads.min(DOMINANT_FILE_PARALLEL_THREAD_CAP);
+    let dominant_threads = shard_budget.min(dominant_parallel_thread_cap(shard_budget));
     (dominant_threads > 1).then_some(dominant_threads)
 }
 
@@ -925,6 +1135,7 @@ fn completed_outcome(
     bytes: u64,
     hits: Vec<SearchHit>,
     match_count: usize,
+    shard_plan: Option<ParallelShardPlan>,
 ) -> FileScanOutcome {
     FileScanOutcome {
         path: path.to_path_buf(),
@@ -933,6 +1144,7 @@ fn completed_outcome(
         hits,
         match_count,
         scanned: true,
+        shard_plan,
     }
 }
 
@@ -944,6 +1156,7 @@ fn failed_outcome(path: &Path, bytes: u64) -> FileScanOutcome {
         hits: Vec::new(),
         match_count: 0,
         scanned: false,
+        shard_plan: None,
     }
 }
 
@@ -958,10 +1171,12 @@ mod tests {
     use crate::ExpressionPlan;
 
     use super::{
-        auto_threads_for_shape, discover_files, parallel_fast_count_threads, partition_roots,
-        run_search, should_stream_stats_only,
-        SearchConfig, DOMINANT_FILE_PARALLEL_THREAD_CAP, DOMINANT_FILE_PARALLEL_THRESHOLD,
-        PARALLEL_FAST_COUNT_FILE_THRESHOLD,
+        auto_threads_for_shape, auto_threads_for_shape_with_available,
+        auto_threads_for_streaming_with_available, discover_files, dominant_parallel_thread_cap,
+        parallel_fast_count_min_chunk_bytes, parallel_fast_count_plan_with_available,
+        partition_roots, run_search, should_stream_stats_only, threads_90pct, SearchConfig,
+        DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX, DOMINANT_FILE_PARALLEL_THRESHOLD,
+        PARALLEL_FAST_COUNT_FILE_THRESHOLD, PARALLEL_FAST_COUNT_MEDIUM_MIN_CHUNK_BYTES,
     };
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
@@ -984,35 +1199,114 @@ mod tests {
 
     #[test]
     fn auto_threads_uses_parallelism_for_large_corpora_without_byte_samples() {
-        assert_eq!(auto_threads_for_shape(1), 1);
-        assert!(auto_threads_for_shape(2_048) >= 8);
+        assert_eq!(auto_threads_for_shape_with_available(1, 32), 1);
+        assert!(auto_threads_for_shape_with_available(2_048, 16) >= 8);
     }
 
     #[test]
-    fn parallel_fast_count_threads_stays_off_for_small_or_outer_parallel_medium_files() {
+    fn threads_90pct_never_returns_zero_and_never_exceeds_available() {
+        for available in [0usize, 1, 2, 3, 4, 8, 16, 32, 64] {
+            let resolved = threads_90pct(available);
+            assert!(resolved >= 1);
+            assert!(resolved <= available.max(1));
+        }
+    }
+
+    #[test]
+    fn auto_threads_for_shape_switches_to_90pct_for_large_file_sets() {
+        let available = 32;
+        assert_eq!(auto_threads_for_shape_with_available(24, available), 1);
+        assert_eq!(auto_threads_for_shape_with_available(128, available), 4);
+        assert_eq!(auto_threads_for_shape_with_available(1_023, available), 8);
         assert_eq!(
-            parallel_fast_count_threads(PARALLEL_FAST_COUNT_FILE_THRESHOLD - 1, 1),
-            None
+            auto_threads_for_shape_with_available(1_024, available),
+            threads_90pct(available)
+        );
+    }
+
+    #[test]
+    fn auto_threads_for_streaming_uses_90pct_of_available_parallelism() {
+        assert_eq!(auto_threads_for_streaming_with_available(1), 1);
+        assert_eq!(
+            auto_threads_for_streaming_with_available(16),
+            threads_90pct(16)
         );
         assert_eq!(
-            parallel_fast_count_threads(PARALLEL_FAST_COUNT_FILE_THRESHOLD, 8),
+            auto_threads_for_streaming_with_available(32),
+            threads_90pct(32)
+        );
+    }
+
+    #[test]
+    fn dominant_parallel_thread_cap_scales_with_budget_but_is_clamped() {
+        assert_eq!(dominant_parallel_thread_cap(1), 4);
+        assert_eq!(dominant_parallel_thread_cap(4), 4);
+        assert_eq!(dominant_parallel_thread_cap(8), 4);
+        assert_eq!(dominant_parallel_thread_cap(16), 4);
+        assert_eq!(dominant_parallel_thread_cap(28), 7);
+        assert_eq!(
+            dominant_parallel_thread_cap(64),
+            DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX
+        );
+    }
+
+    #[test]
+    fn parallel_fast_count_plan_stays_off_for_small_files() {
+        assert_eq!(
+            parallel_fast_count_plan_with_available(PARALLEL_FAST_COUNT_FILE_THRESHOLD - 1, 1, 32),
             None
         );
     }
 
     #[test]
-    fn parallel_fast_count_threads_enables_single_threaded_large_files() {
-        let threads = parallel_fast_count_threads(PARALLEL_FAST_COUNT_FILE_THRESHOLD, 1)
+    fn parallel_fast_count_plan_enables_single_threaded_large_files() {
+        let file_len = PARALLEL_FAST_COUNT_FILE_THRESHOLD * 4;
+        let shard_plan = parallel_fast_count_plan_with_available(file_len, 1, 32)
             .expect("large single-threaded files should parallelize");
-        assert!(threads > 1);
+        assert!(shard_plan.shard_threads > 1);
+        assert!(shard_plan.range_count >= shard_plan.shard_threads);
+        assert!(shard_plan.chunk_bytes >= PARALLEL_FAST_COUNT_MEDIUM_MIN_CHUNK_BYTES);
     }
 
     #[test]
-    fn parallel_fast_count_threads_enables_giant_file_override_under_outer_parallelism() {
-        let threads = parallel_fast_count_threads(DOMINANT_FILE_PARALLEL_THRESHOLD, 16)
-            .expect("dominant giant files should get an inner parallel override");
-        assert!(threads > 1);
-        assert!(threads <= DOMINANT_FILE_PARALLEL_THREAD_CAP);
+    fn parallel_fast_count_plan_enables_giant_file_override_under_outer_parallelism() {
+        let shard_plan =
+            parallel_fast_count_plan_with_available(DOMINANT_FILE_PARALLEL_THRESHOLD, 16, 32)
+                .expect("dominant giant files should get an inner parallel override");
+        assert!(shard_plan.shard_threads > 1);
+        assert!(shard_plan.shard_threads <= DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX);
+        assert!(shard_plan.range_count >= shard_plan.shard_threads);
+    }
+
+    #[test]
+    fn parallel_fast_count_plan_enables_outer_parallel_large_files_with_capped_budget() {
+        let file_len = PARALLEL_FAST_COUNT_FILE_THRESHOLD * 4;
+        let shard_plan = parallel_fast_count_plan_with_available(file_len, 8, 32)
+            .expect("outer-parallel large files should receive a capped inner shard budget");
+        assert_eq!(shard_plan.shard_threads, 3);
+        assert!(shard_plan.range_count >= shard_plan.shard_threads);
+    }
+
+    #[test]
+    fn parallel_fast_count_plan_feeds_threads_with_multiple_ranges_on_mid_size_files() {
+        let file_len = 144 * 1024 * 1024;
+        let shard_plan = parallel_fast_count_plan_with_available(file_len, 1, 32)
+            .expect("mid-size shard-safe files should parallelize");
+        assert!(shard_plan.shard_threads > 1);
+        assert!(shard_plan.range_count >= shard_plan.shard_threads);
+        assert!(
+            shard_plan.chunk_bytes >= parallel_fast_count_min_chunk_bytes(file_len),
+            "chunk floor should stay dynamic per file shape"
+        );
+    }
+
+    #[test]
+    fn parallel_fast_count_plan_enables_two_range_files_at_threshold_plus_epsilon() {
+        let file_len = PARALLEL_FAST_COUNT_FILE_THRESHOLD + 4 * 1024;
+        let shard_plan = parallel_fast_count_plan_with_available(file_len, 8, 32)
+            .expect("two-range files should parallelize when shard budget allows");
+        assert!(shard_plan.shard_threads >= 2);
+        assert!(shard_plan.range_count >= 2);
     }
 
     #[test]
@@ -1037,6 +1331,10 @@ mod tests {
         assert_eq!(report.stats.overlap_pruned_roots, 0);
         assert_eq!(report.stats.discovered_duplicate_paths, 0);
         assert_eq!(report.stats.acceleration_bailouts, 0);
+        assert_eq!(report.stats.concurrency.execution_mode, "materialized");
+        assert_eq!(report.stats.concurrency.outer_scan_threads, 1);
+        assert!(report.stats.concurrency.available_threads >= 1);
+        assert!(!report.stats.concurrency.sharding_enabled);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1247,6 +1545,10 @@ mod tests {
         assert_eq!(stats_only.stats.overlap_pruned_roots, 0);
         assert_eq!(stats_only.stats.discovered_duplicate_paths, 0);
         assert_eq!(stats_only.stats.acceleration_bailouts, 0);
+        assert_eq!(
+            stats_only.stats.concurrency.execution_mode,
+            "streaming_stats_only"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1279,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_only_streaming_gate_stays_off_for_single_root_directory_searches() {
+    fn stats_only_streaming_gate_stays_on_for_single_root_directory_searches() {
         let root = unique_temp_path("iex-engine-streaming-gate-single-root");
         fs::create_dir_all(&root).expect("root dir should be created");
         fs::write(root.join("needle.txt"), "needle here\n").expect("fixture file should write");
@@ -1289,7 +1591,7 @@ mod tests {
         config.collect_hits = false;
         let roots = partition_roots(&config);
 
-        assert!(!should_stream_stats_only(&config, &roots));
+        assert!(should_stream_stats_only(&config, &roots));
 
         let _ = fs::remove_dir_all(root);
     }
