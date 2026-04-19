@@ -31,6 +31,11 @@ Most search tools are built for clean source trees. iEx is built for the rest.
 ```sh
 cargo install iex-cli
 
+# Agent-friendly rg-style ingress for simple searches
+iex timeout .
+iex -F -i "session timeout" .
+iex -e timeout -e error .
+
 # Structured JSON output
 iex search "lit:error && re:\btimeout\b" . --json
 
@@ -42,6 +47,23 @@ iex explain "lit:breach && lit:auth"
 ```
 
 **Binaries (no Rust required):** [github.com/savageops/iEx/releases](https://github.com/savageops/iEx/releases)
+
+---
+
+## rg-style ingress compatibility
+
+`iex search` and `iex explain` remain the canonical iEx CLI surface. For agent-friendly local search, iEx also accepts a narrow ripgrep-shaped ingress layer and lowers it into the same native search path.
+
+- `iex PATTERN [PATH]...`
+- `iex -e PATTERN [PATH]...`
+- `iex -F`
+- `iex -i`
+- `iex -j`
+- `iex -n` as a no-op
+- `iex --json`
+- `iex --hidden`
+
+If a request falls outside that subset, iEx returns a guided non-zero error instead of trying to emulate full ripgrep behavior.
 
 ---
 

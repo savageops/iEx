@@ -200,6 +200,7 @@ dependencies = [
  "anyhow",
  "clap",
  "iex-core",
+ "regex",
  "serde_json",
 ]
 
