@@ -49,6 +49,9 @@ enum RegexFastPath {
         #[allow(dead_code)]
         reject_fast: Option<RejectFastGate>,
     },
+    FixedWidthBytesRegex {
+        match_len: usize,
+    },
     WordBoundaryLiteral {
         literal: Vec<u8>,
         finder: memmem::Finder<'static>,
@@ -419,6 +422,7 @@ impl ExpressionPlan {
                 Some(RegexFastPath::AsciiCaseFoldLiteral { searcher, .. }) => {
                     count_casefold_literal_occurrences_bytes(haystack, searcher)
                 }
+                Some(RegexFastPath::FixedWidthBytesRegex { .. }) => bytes.find_iter(haystack).count(),
                 Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                     count_word_boundary_literal_occurrences_bytes(haystack, literal, finder)
                 }
@@ -452,7 +456,9 @@ impl ExpressionPlan {
         }
 
         match self.compiled.as_slice() {
-            [Predicate::Regex { fast_path, .. }] => match fast_path {
+            [Predicate::Regex {
+                bytes, fast_path, ..
+            }] => match fast_path {
                 Some(RegexFastPath::PlainLiteral {
                     needle_len, finder, ..
                 }) => Some(count_literal_occurrences_bytes_in_range(
@@ -470,6 +476,15 @@ impl ExpressionPlan {
                         bounded_end,
                     ))
                 }
+                Some(RegexFastPath::FixedWidthBytesRegex { match_len }) => Some(
+                    count_fixed_width_regex_occurrences_bytes_in_range(
+                        haystack,
+                        bytes,
+                        *match_len,
+                        start,
+                        bounded_end,
+                    ),
+                ),
                 Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                     Some(count_word_boundary_literal_occurrences_bytes_in_range(
                         haystack,
@@ -607,6 +622,7 @@ fn predicate_matches_bytes(predicate: &Predicate, haystack: &[u8]) -> bool {
             Some(RegexFastPath::AsciiCaseFoldLiteral { searcher, .. }) => {
                 first_casefold_literal_column_bytes(haystack, searcher).is_some()
             }
+            Some(RegexFastPath::FixedWidthBytesRegex { .. }) => bytes.is_match(haystack),
             Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                 first_word_boundary_literal_column_bytes(haystack, literal, finder).is_some()
             }
@@ -634,6 +650,9 @@ fn predicate_column_bytes(predicate: &Predicate, haystack: &[u8]) -> Option<usiz
             Some(RegexFastPath::PlainLiteral { finder, .. }) => finder.find(haystack),
             Some(RegexFastPath::AsciiCaseFoldLiteral { searcher, .. }) => {
                 first_casefold_literal_column_bytes(haystack, searcher)
+            }
+            Some(RegexFastPath::FixedWidthBytesRegex { .. }) => {
+                bytes.find(haystack).map(|m| m.start())
             }
             Some(RegexFastPath::WordBoundaryLiteral { literal, finder }) => {
                 first_word_boundary_literal_column_bytes(haystack, literal, finder)
@@ -665,14 +684,24 @@ fn classify_regex_fast_path(pattern: &str) -> Option<RegexFastPath> {
         });
     }
 
-    if is_plain_ascii_literal(core_pattern) {
-        let reject_fast =
-            RejectFastGate::from_literals([core_pattern.as_bytes()], case_insensitive);
+    if is_plain_literal(core_pattern) {
+        let reject_fast = core_pattern
+            .is_ascii()
+            .then(|| RejectFastGate::from_literals([core_pattern.as_bytes()], case_insensitive))
+            .flatten();
         if case_insensitive {
-            return Some(RegexFastPath::AsciiCaseFoldLiteral {
-                searcher: AsciiCaseFoldSearcher::new(core_pattern.as_bytes())?,
-                reject_fast,
-            });
+            if core_pattern.is_ascii() {
+                return Some(RegexFastPath::AsciiCaseFoldLiteral {
+                    searcher: AsciiCaseFoldSearcher::new(core_pattern.as_bytes())?,
+                    reject_fast,
+                });
+            }
+            if has_stable_casefold_match_width(core_pattern) {
+                return Some(RegexFastPath::FixedWidthBytesRegex {
+                    match_len: core_pattern.len(),
+                });
+            }
+            return None;
         }
         return Some(RegexFastPath::PlainLiteral {
             needle_len: core_pattern.len(),
@@ -730,29 +759,52 @@ fn parse_literal_alternates(pattern: &str) -> Option<Vec<String>> {
     (parts.len() >= 2).then_some(parts)
 }
 
+fn is_plain_literal(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            !matches!(
+                byte,
+                b'\\'
+                    | b'.'
+                    | b'^'
+                    | b'$'
+                    | b'*'
+                    | b'+'
+                    | b'?'
+                    | b'('
+                    | b')'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+                    | b'|'
+            )
+        })
+}
+
 fn is_plain_ascii_literal(value: &str) -> bool {
-    if !value.is_ascii() {
-        return false;
+    value.is_ascii() && is_plain_literal(value)
+}
+
+fn has_stable_casefold_match_width(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(char_has_stable_casefold_match_width)
+}
+
+fn char_has_stable_casefold_match_width(ch: char) -> bool {
+    let width = ch.len_utf8();
+    single_case_mapping_width(ch.to_lowercase()) == Some(width)
+        && single_case_mapping_width(ch.to_uppercase()) == Some(width)
+}
+
+fn single_case_mapping_width<I>(mut chars: I) -> Option<usize>
+where
+    I: Iterator<Item = char>,
+{
+    let mapped = chars.next()?;
+    if chars.next().is_some() {
+        return None;
     }
-    value.bytes().all(|byte| {
-        !matches!(
-            byte,
-            b'\\'
-                | b'.'
-                | b'^'
-                | b'$'
-                | b'*'
-                | b'+'
-                | b'?'
-                | b'('
-                | b')'
-                | b'['
-                | b']'
-                | b'{'
-                | b'}'
-                | b'|'
-        )
-    })
+    Some(mapped.len_utf8())
 }
 
 fn owned_finder(needle: &[u8]) -> memmem::Finder<'static> {
@@ -1013,6 +1065,28 @@ fn count_literal_occurrences_bytes_in_range(
     finder
         .find_iter(&haystack[slice_start..slice_end])
         .map(|offset| slice_start + offset)
+        .filter(|&absolute_start| absolute_start >= start && absolute_start < end)
+        .count()
+}
+
+fn count_fixed_width_regex_occurrences_bytes_in_range(
+    haystack: &[u8],
+    regex: &BytesRegex,
+    match_len: usize,
+    start: usize,
+    end: usize,
+) -> usize {
+    if match_len == 0 || start >= end {
+        return 0;
+    }
+
+    let overlap = match_len.saturating_sub(1);
+    let slice_start = start.saturating_sub(overlap);
+    let slice_end = haystack.len().min(end.saturating_add(overlap));
+
+    regex
+        .find_iter(&haystack[slice_start..slice_end])
+        .map(|m| slice_start + m.start())
         .filter(|&absolute_start| absolute_start >= start && absolute_start < end)
         .count()
 }
@@ -1297,9 +1371,30 @@ mod tests {
     }
 
     #[test]
-    fn case_insensitive_fast_path_does_not_activate_for_non_ascii_literals() {
+    fn case_insensitive_fast_path_does_not_activate_for_variable_width_non_ascii_literals() {
         let plan = ExpressionPlan::parse(r"re:(?i)Straße").expect("plan should parse");
         assert!(regex_fast_path(&plan).is_none());
+    }
+
+    #[test]
+    fn case_insensitive_fast_path_activates_for_fixed_width_non_ascii_literals() {
+        let plan = ExpressionPlan::parse(r"re:(?i)Шерлок Холмс").expect("plan should parse");
+        assert!(matches!(
+            regex_fast_path(&plan),
+            Some(RegexFastPath::FixedWidthBytesRegex { match_len })
+                if *match_len == "Шерлок Холмс".len()
+        ));
+        assert!(plan.supports_outer_parallel_shard_fast_count());
+    }
+
+    #[test]
+    fn case_insensitive_fixed_width_non_ascii_fast_path_counts_matches() {
+        let plan = ExpressionPlan::parse(r"re:(?i)Шерлок Холмс").expect("plan should parse");
+        let haystack = "Шерлок Холмс xx Шерлок Холмс xx Шерлок Холмс";
+        assert_eq!(
+            plan.fast_match_count_no_hits_bytes(haystack.as_bytes()),
+            Some(3)
+        );
     }
 
     #[test]
@@ -1419,6 +1514,27 @@ mod tests {
         .map(|count| {
             count.expect("range count should use case-insensitive word-boundary fast path")
         })
+        .sum::<usize>();
+
+        assert_eq!(
+            ranged,
+            plan.fast_match_count_no_hits_bytes(haystack)
+                .unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn case_insensitive_fixed_width_non_ascii_range_count_matches_full_count() {
+        let plan = ExpressionPlan::parse(r"re:(?i)Шерлок Холмс").expect("plan should parse");
+        let haystack = "xxШерлок ХолмсxxШерлок ХолмсxxШерлок Холмс";
+        let haystack = haystack.as_bytes();
+        let ranged = [
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 0, 18),
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 18, 43),
+            plan.fast_match_count_no_hits_bytes_in_range(haystack, 43, haystack.len()),
+        ]
+        .into_iter()
+        .map(|count| count.expect("range count should use fixed-width regex fast path"))
         .sum::<usize>();
 
         assert_eq!(

@@ -270,7 +270,7 @@
 
       <section class="card">
         <div class="section-bar">
-          <h2>Ratio Trend (iEx/rg + iEx/ugrep)</h2>
+          <h2>Ratio Trend (iEx/rg + iEx/previous)</h2>
           <div class="segmented-control" id="trend-window-controls" role="group" aria-label="Ratio trend window">
             <button type="button" data-trend-window="1h" aria-pressed="false">1h</button>
             <button type="button" data-trend-window="12h" aria-pressed="true" class="is-active">12h</button>
@@ -281,12 +281,12 @@
         </div>
         <div class="trend-legend" aria-hidden="true">
           <span class="trend-legend-item" style="color:#6ec7ff"><span class="trend-legend-swatch"></span>iEx/rg</span>
-          <span class="trend-legend-item" style="color:#2dd28c"><span class="trend-legend-swatch"></span>iEx/ugrep</span>
+          <span class="trend-legend-item" style="color:#ff7a8a"><span class="trend-legend-swatch"></span>iEx/previous</span>
           <span class="trend-legend-item" style="color:#f3b04a"><span class="trend-legend-swatch"></span>1.0x parity</span>
         </div>
         <p class="muted trend-meta" id="trend-meta">n/a</p>
         <canvas id="ratio-trend" width="1280" height="320"></canvas>
-        <p class="muted">1.0x baseline means parity. Above 1.0x means iEx is slower. Below 1.0x means iEx is faster. The green line only renders where `ugrep` timings exist in the selected window.</p>
+        <p class="muted">1.0x baseline means parity. Above 1.0x means iEx is slower. Below 1.0x means iEx is faster. The previous-build lane only renders when a previous iEx snapshot was configured for the run.</p>
       </section>
 
       <section class="grid-2">
@@ -337,11 +337,11 @@
               <th>Profile</th>
               <th>iEx/rg</th>
               <th>vs rg %</th>
-              <th>iEx/ugrep</th>
-              <th>vs ugrep %</th>
+              <th>iEx/prev</th>
+              <th>vs prev %</th>
               <th>iEx ms</th>
               <th>rg ms</th>
-              <th>ugrep ms</th>
+              <th>prev iEx ms</th>
               <th>Hotspot</th>
             </tr>
           </thead>
@@ -601,15 +601,32 @@
           }
           return asNum(run?.iexToRgRatio, iex / rg);
         }
-        if (lane === "ugrep") {
-          const competitor = run?.competitors?.ugrep;
-          const ugrep = asNum(competitor?.durationMs, 0);
-          if (!competitor?.available || ugrep <= 0) {
-            return null;
-          }
-          return iex / ugrep;
+        if (lane === "previous") {
+          const competitor = competitorRunMetrics(run, "iex_previous");
+          return competitor.available ? competitor.ratio : null;
         }
         return null;
+      }
+
+      function competitorRunMetrics(run, name) {
+        const iex = asNum(run?.iexMs, 0);
+        const competitor = run?.competitors?.[name];
+        const durationMs = asNum(competitor?.durationMs, 0);
+        const available = Boolean(competitor?.available && iex > 0 && durationMs > 0);
+        const ratio = available ? iex / durationMs : null;
+        const speedupPct = available ? ((durationMs - iex) / durationMs) * 100 : null;
+        return {
+          competitor,
+          available,
+          durationMs,
+          ratio,
+          speedupPct,
+        };
+      }
+
+      function competitorSummaryEntry(name) {
+        const competitors = currentSummary()?.competitorSummary || [];
+        return competitors.find((entry) => entry.name === name) || null;
       }
 
       function updateTrendWindowButtons() {
@@ -664,6 +681,8 @@
         const goalHits = sum?.goalHits || {};
         const selfImprovement = sum?.selfImprovement || {};
         const primaryChallenger = sum?.primaryChallenger || null;
+        const previousIex = competitorSummaryEntry("iex_previous");
+        const previousIexAvailable = previousIex?.status === "available";
         const medianRatio = asNum(ratio.median, 0);
         const p95Ratio = asNum(ratio.p95, 0);
         const selfPct = asNum(selfImprovement.improvementPct, 0);
@@ -701,6 +720,12 @@
               ? `<span class="${ratioClass(asNum(primaryChallenger?.iexRatio?.median, 0))}">${ratioLabel(asNum(primaryChallenger?.iexRatio?.median, 0))}</span>`
               : "n/a",
           ],
+          [
+            "iEx/Previous",
+            previousIexAvailable
+              ? `<span class="${ratioClass(asNum(previousIex?.iexRatio?.median, 0))}">${ratioLabel(asNum(previousIex?.iexRatio?.median, 0))}</span>`
+              : "n/a",
+          ],
         ];
         metricGrid.innerHTML = metrics
           .map(([label, value]) => `<div class="metric"><div class="label">${label}</div><div class="value">${value}</div></div>`)
@@ -713,6 +738,8 @@
         const recent = sum?.recent || {};
         const selfImprovement = sum?.selfImprovement || {};
         const challenger = sum?.primaryChallenger || null;
+        const previousIex = competitorSummaryEntry("iex_previous");
+        const previousIexAvailable = previousIex?.status === "available";
         const selfWindowLabel = selfImprovement.windowSize > 0
           ? `prev ${selfImprovement.windowSize}`
           : "baseline";
@@ -740,6 +767,16 @@
             "iEx/challenger ratio",
             challenger ? `${fmt(challenger.iexRatio?.median, 3)}x` : "n/a",
             challenger ? `${fmt(challenger.iexRatio?.p95, 3)}x p95` : "n/a",
+          ],
+          [
+            "iEx/previous ratio",
+            previousIexAvailable ? `${fmt(previousIex.iexRatio?.median, 3)}x` : "n/a",
+            previousIexAvailable ? `${fmt(previousIex.iexRatio?.p95, 3)}x p95` : "n/a",
+          ],
+          [
+            "Previous iEx ms",
+            previousIexAvailable ? `${fmt(previousIex.durationMs?.median)} median` : "n/a",
+            previousIexAvailable ? `${fmt(previousIex.durationMs?.p95)} p95` : "n/a",
           ],
           [
             "Self iEx Median ms",
@@ -797,7 +834,7 @@
             const status = competitor?.status || "n/a";
             const statusClass = status === "available" ? "good" : "warn";
             return `<tr>
-              <td>${competitor.name}</td>
+              <td>${competitor.label || competitor.name}</td>
               <td>${asNum(competitor.availableRuns, 0)} / ${asNum(competitor.runCount, 0)}</td>
               <td>${competitor.status === "available" ? fmt(competitor?.durationMs?.median) : "n/a"}</td>
               <td>${competitor.status === "available" ? fmt(competitor?.durationMs?.p95) : "n/a"}</td>
@@ -828,8 +865,8 @@
         }
 
         const rgRatios = runs.map((run) => trendRatioFor(run, "rg"));
-        const ugrepRatios = runs.map((run) => trendRatioFor(run, "ugrep"));
-        const ratios = [...rgRatios, ...ugrepRatios].filter((value) => Number.isFinite(value) && value > 0);
+        const previousRatios = runs.map((run) => trendRatioFor(run, "previous"));
+        const ratios = [...rgRatios, ...previousRatios].filter((value) => Number.isFinite(value) && value > 0);
         if (!ratios.length) {
           trendMeta.textContent = `No comparable ratio data is available in the ${trendWindowConfig().label} window.`;
           return;
@@ -844,8 +881,8 @@
         const maxY = Math.max(1.25, maxCandidate);
         const startLabel = runs[0]?.timestamp ? new Date(runs[0].timestamp).toLocaleString() : "n/a";
         const endLabel = runs[runs.length - 1]?.timestamp ? new Date(runs[runs.length - 1].timestamp).toLocaleString() : "n/a";
-        const ugrepCoverage = ugrepRatios.filter((value) => Number.isFinite(value) && value > 0).length;
-        trendMeta.textContent = `Showing ${trendWindowConfig().label} • ${runs.length} runs • ${startLabel} -> ${endLabel} • ugrep coverage ${ugrepCoverage}/${runs.length}`;
+        const previousCoverage = previousRatios.filter((value) => Number.isFinite(value) && value > 0).length;
+        trendMeta.textContent = `Showing ${trendWindowConfig().label} • ${runs.length} runs • ${startLabel} -> ${endLabel} • previous iEx coverage ${previousCoverage}/${runs.length}`;
 
         function yFor(value) {
           return pad + h - ((value - minY) / (maxY - minY || 1)) * h;
@@ -902,7 +939,7 @@
         }
 
         drawSeries(rgRatios, "#6ec7ff");
-        drawSeries(ugrepRatios, "#2dd28c");
+        drawSeries(previousRatios, "#ff7a8a");
       }
 
       function renderProfileTable() {
@@ -950,27 +987,18 @@
           .map((run) => {
             const rg = asNum(run.rgMs, 0);
             const iex = asNum(run.iexMs, 0);
-            const ugrep = asNum(run?.competitors?.ugrep?.durationMs, 0);
-            const ugrepAvailable = run?.competitors?.ugrep?.available && ugrep > 0;
-            const ugrepText =
-              ugrepAvailable
-                ? fmt(ugrep)
-                : "n/a";
             const rgRatio = asNum(run.iexToRgRatio, rg > 0 ? iex / rg : 0);
-            const ugrepRatio = ugrepAvailable ? asNum(iex / ugrep, 0) : 0;
-            const ugrepSpeedup = ugrepAvailable
-              ? ((ugrep - iex) / ugrep) * 100
-              : null;
+            const previous = competitorRunMetrics(run, "iex_previous");
             return `<tr>
               <td>${new Date(run.timestamp).toLocaleString()}</td>
               <td>${run.profile}</td>
               <td class="${ratioClass(rgRatio)}">${fmt(rgRatio, 3)}x</td>
               <td>${fmt(run.speedupPct)}%</td>
-              <td class="${ugrepAvailable ? ratioClass(ugrepRatio) : "muted"}">${ugrepAvailable ? `${fmt(ugrepRatio, 3)}x` : "n/a"}</td>
-              <td>${ugrepAvailable ? `${fmt(ugrepSpeedup)}%` : "n/a"}</td>
+              <td class="${previous.available ? ratioClass(previous.ratio) : "muted"}">${previous.available ? `${fmt(previous.ratio, 3)}x` : "n/a"}</td>
+              <td>${previous.available ? `${fmt(previous.speedupPct)}%` : "n/a"}</td>
               <td>${fmt(iex)}</td>
               <td>${fmt(rg)}</td>
-              <td>${ugrepText}</td>
+              <td>${previous.available ? fmt(previous.durationMs) : "n/a"}</td>
               <td>${run.hotspot || "n/a"}</td>
             </tr>`;
           })
