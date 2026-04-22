@@ -2,9 +2,9 @@
 
 # iEx
 
-**Rust search kernel with workload-adaptive execution geometry.**
+**Rust search CLI and benchmark platform with workload-aware execution and proof-first performance governance.**
 
-*Validates at 93.5x over ripgrep on PCRE2 prefilter-eligible patterns. Holds throughput across corpus topologies that cause NFA/DFA-based tools to degrade.*
+*Routes literal and regex searches through the cheapest exact path it can prove, then measures every performance slice against immutable baselines before promotion.*
 
 ---
 
@@ -20,9 +20,9 @@
 
 ---
 
-iEx routes each workload to the minimum-cost exact execution path: sequential scan for well-formed trees, streaming pipeline for wide artifact forests, inward byte-range sharding for files that dominate corpus byte volume. On a 40 GB forensic corpus it returned exact match counts across 20 patterns and ran **93.5x faster than ripgrep** on PCRE2 patterns with extractable literal prefilters, and **14.8x faster** on SHA-256 alternation patterns that route through Aho-Corasick with the Teddy SIMD backend active.
+iEx v2 is a Rust-first search engine plus benchmark harness. The current core routes work between materialized scan, `--stats-only` streaming dispatch, and shard-safe large-file fast count for eligible lanes. Regex execution stays inside the Rust `regex` / `regex::bytes` stack, with planner-owned fast paths for literal-equivalent shapes and a decomposed candidate path for eligible stats-only regex workloads.
 
-Most search tools are built for clean source trees. iEx is built for the rest.
+The repo target is explicit: beat ripgrep on transparent benchmark suites. The operator contract is just as important as the matcher contract: `bench:report` is the raw external provenance surface, `bench:loop` is the live diagnostics feed, and every promotion must beat an immutable current binary snapshot before the loop moves.
 
 ---
 
@@ -76,33 +76,37 @@ An explicit predicate syntax with native boolean composition. The expression pla
 | `lit:` | Substring containment | `lit:error` |
 | `prefix:` | Line-anchored prefix match | `prefix:WARN` |
 | `suffix:` | Line-anchored suffix match | `suffix:.json` |
-| `re:` | Regex -- lowered to exact machine or PCRE2 | `re:\btimeout\b` |
+| `re:` | Regex -- lowered to Rust regex text/byte plans plus narrow fast paths | `re:\btimeout\b` |
 
 - `A && B` -- conjunction; all predicates must hold on the same line
 - `A || B` -- disjunction; any predicate holds
+- `re:` follows the current Rust `regex` syntax contract. Look-around and backreferences are not part of the shipped engine surface.
 
 ---
 
-## Corpus validation
+## Benchmark governance
 
-Twenty search patterns against a 40 GB forensic corpus: JSONL session transcripts, IR artifacts, malware analysis records, and configuration remnants from a server-level XMRig compromise with BMC-level persistence artifacts. The corpus exhibited the failure modes iEx is designed for -- dominant tail files, wide-line JSONL records, and multi-root trees from mixed incident sources. iEx returned exact match counts on all 20 patterns.
+iEx keeps three benchmark surfaces aligned:
 
-| Pattern | ripgrep | iEx | Delta |
-|---|---|---|---|
-| Literal, 40 GB corpus | 7.1 ms | 5.7 ms | 1.3x |
-| CVE regex | 53.3 ms | 26.1 ms | 2.0x |
-| Malware artifact paths | 71.7 ms | 19.2 ms | 3.7x |
-| 4-way conjunction | 77.5 ms | 26.1 ms | 3.0x |
-| Multi-root (3x) | 54.8 ms | 16.9 ms | 3.2x |
-| SHA-256 `[0-9a-f]{64}` | 886.7 ms | 59.8 ms | **14.8x** |
-| PCRE2 negative lookahead | 1970 ms | 21.1 ms | **93.5x** |
+- canonical external raw baseline: `npm run bench:report` -> `tools/reports/bench/ripgrep-benchsuite-*.csv`
+- live operator diagnostics: `npm run bench:loop` -> `tools/reports/live-metrics.jsonl`
+- exact binary proof: timestamped `tools/reports/candidate-compare/iex-cli-*.exe` snapshots plus compare artifacts
 
-The 93.5x gap on negative lookahead reflects ripgrep's full DFA fallback cost against iEx's literal-prefilter-then-confirm path on the same input. SHA-256 routes to `LiteralAlternates` via Aho-Corasick with the Teddy SIMD backend active. Deltas widen with corpus irregularity and narrow toward parity on clean uniform source trees.
+Key live fields:
+- `iexMs`, `iexCliMs`, and `iexProcessOverheadMs`
+- `phaseMs`, `slowestFiles`, and `concurrency`
+- `regexDecomposition` for eligible/count/bailout/candidate-line attribution on decomposed regex lanes
+- `competitors.ripgrep` and optional `competitors.iex_previous`
 
-Harnesses, differentials, and comparison artifacts: `tools/reports/`. Live benchmark loop: `dashboard/`.
+Promotion rule:
+1. snapshot the current canonical or live binary
+2. compare the candidate against that exact snapshot on the exact workload
+3. only then restart the loop on a timestamped immutable snapshot if the suite-level proof is neutral or better
 
 ```sh
-node tools/scripts/benchsuite-ripgrep.mjs list
+npm run bench:report
+npm run bench:loop
+npm run bench:once -- --expression "re:\\w+\\s+Holmes\\s+\\w+" --corpus ".refs/ripgrep/benchsuite/subtitles/en.sample.txt"
 ```
 
 ---
@@ -194,11 +198,11 @@ Thread budget resolution and geometry resolution are co-scoped. The planner does
 <details>
 <summary><strong>Pattern lowering</strong></summary>
 
-The regex surface is a lowering target. At parse time, the classifier walks the AST via `regex-syntax` to extract inner literal substrings from complex expressions -- `\d+foo\d+` yields `foo` as a required prefilter candidate, ranked by byte-frequency rarity. Each pattern classifies into the minimum-cost exact machine type before reaching the full PCRE2 engine.
+Regex planning is a lowering step, not a second engine. `regex-syntax` HIR analysis classifies the narrowest exact machine that preserves the current Rust regex contract. For eligible stats-only byte-mode regexes, the planner can extract a strongest required literal, optionally prove local context such as `word + whitespace + literal + whitespace + word`, then recover line bounds around whole-buffer candidate hits before running full `regex::bytes` confirmation on those lines.
 
 ```mermaid
 flowchart TD
-    Q[Query string] --> AST[regex-syntax AST walk\nInner literal extraction\nByte-frequency rarity ranking]
+    Q[Query string] --> AST[regex-syntax HIR walk\nrequired literal extraction\nlocal context gating]
     AST --> C1{Whole-pattern literal?}
     C1 -->|Yes| P1[PlainLiteral\nmemmem · AVX2 / SSE2 / NEON\n~30 GB/s]
     C1 -->|No| C2{ASCII case-fold literal?}
@@ -207,23 +211,26 @@ flowchart TD
     C3 -->|Yes| P3[WordBoundaryLiteral\nmemchr + byte mask · SSE2/NEON]
     C3 -->|No| C4{Alternation of short literals?}
     C4 -->|Yes| P4[LiteralAlternates\nAho-Corasick · Teddy SIMD · packed=true\n2 to 10x over standard AC]
-    C4 -->|No| C5{Inner literal extractable?}
-    C5 -->|Yes| P5[Prefilter on rarest byte\nmemchr scan then PCRE2 confirm]
-    C5 -->|No| P6[Generic PCRE2\nFull NFA/DFA engine · fallback only]
+    C4 -->|No| C5{Decomposition eligible?}
+    C5 -->|Yes| P5[RegexDecomposition stats-only path\nwhole-buffer literal finder\nline-boundary recovery\nfull bytes-regex confirm]
+    C5 -->|No| P6[Generic bytes regex\ncanonical byte-mode line scan fallback]
 ```
 
-| Machine | Implementation | Throughput |
+| Machine | Implementation | Activation |
 |---|---|---|
-| `PlainLiteral` | `memmem`, 128/256-bit vectorized | ~30 GB/s on AVX2 |
-| `AsciiCaseFoldLiteral` | AVX-512 `vpternlogd`, opmask registers `k0`-`k7` | 10+ GB/s, no `movemask` roundtrip |
-| `WordBoundaryLiteral` | `memchr` + boundary mask | SSE2/NEON |
-| `LiteralAlternates` | Aho-Corasick Teddy backend, `packed=true` | 2 to 10x over standard AC |
-| Prefilter + confirm | `memchr` on rarest byte then PCRE2 confirm | Eliminates NFA cost on sparse matches |
-| `Generic PCRE2` | Full NFA/DFA engine | Fallback only |
+| `PlainLiteral` | `memmem` over bytes | whole-pattern literal |
+| `AsciiCaseFoldLiteral` | specialized ASCII case-fold searcher | ASCII literal with `(?i)` semantics |
+| `WordBoundaryLiteral` | `memchr` plus boundary checks | literal-equivalent `\b...\b` |
+| `LiteralAlternates` | `aho-corasick` Teddy backend | short literal alternation families |
+| `FixedWidthBytesRegex` | `regex::bytes` fast-count path | narrow non-ASCII `(?i)` literal-equivalent regexes with stable byte width |
+| `RegexDecomposition` | whole-buffer literal discovery, optional context gate, line-boundary recovery, full `regex::bytes` confirm | stats-only regexes with one strong required literal and no narrower fast path |
+| `Generic bytes regex` | `regex::bytes` on the canonical byte-mode line loop | fallback regex execution |
 
 The `AsciiCaseFoldLiteral` path executes `(byte OR 0x20) == (pattern OR 0x20)` in a single `vpternlogd` instruction cycle. Opmask registers (`k0` through `k7`) produce per-byte results directly, removing the 32-byte to 32-bit `movemask` extraction roundtrip that caps AVX2 case-fold throughput at roughly 1 to 3 GB/s.
 
 The Teddy SIMD backend, ported from Intel Hyperscan, activates via `.packed(Some(true))` on `AhoCorasickBuilder`. For `LiteralAlternates` patterns under 64 short literals it runs 2 to 10x faster than standard automaton traversal.
+
+The decomposition path is intentionally narrower than a generic regex prefilter story. It only activates when the planner can prove one strong required literal, no better fast path already owns the pattern, and candidate-line volume stays below the bailout ceiling.
 
 </details>
 
@@ -300,49 +307,43 @@ Throughput comes from geometry. Exactness comes from ownership.
 <details>
 <summary><strong>Byte ingress tiers</strong></summary>
 
-Before the planner activates, ingress commits to a memory strategy from file size. Each tier eliminates the syscall and allocation overhead of the tier above it for files within its bounds. Binary payloads are rejected on a null-byte sniff before the scan engine activates.
+Before the planner activates, ingress commits to the current source-of-truth file loading strategy in `engine.rs`. Tiny files stay inline, small files are fully read into memory, and larger files are memory-mapped. Binary payloads are rejected on a null-byte sniff before the line scanner or fast-count path runs.
 
 ```mermaid
 flowchart LR
-    A[File Open] --> B{size <= 16KiB?}
-    B -->|Yes| C[Stack buffer\n16KiB inline\nL1-resident\nZero allocator calls]
-    B -->|No| D{size <= 256KiB?}
-    D -->|Yes| E[Vec_u8\nposix_fadvise SEQUENTIAL\nDoubled read-ahead window]
-    D -->|No| F{size <= 4MB?}
-    F -->|Yes| G[pread aligned buffers\nNo page-fault overhead\nPredictable sequential latency]
-    F -->|No| H[Chunked streaming read\n1 to 4MB windows\nBypasses buffer cache]
-    H --> I[Null-byte sniff\nFirst 8KB]
-    I -->|Binary| J[Early reject]
-    I -->|Text| K[Planner]
-    G --> K
-    E --> K
-    C --> K
+    A[Open file] --> B{fits in first 16KiB read?}
+    B -->|Yes| C[Inline stack buffer\nscan_loaded_bytes]
+    B -->|No| D{metadata.len <= 256KiB?}
+    D -->|Yes| E[Vec_u8 full read\nscan_loaded_bytes]
+    D -->|No| F[memmap2 mmap\nscan_loaded_bytes]
+    C --> G[Null-byte sniff]
+    E --> G
+    F --> G
+    G -->|Binary| H[Skip file]
+    G -->|Text| I[Planner and scan kernel]
 ```
 
 | Tier | Bound | Strategy | Rationale |
 |---|---|---|---|
-| Tiny | < 16 KiB | Stack buffer, 16 KiB inline | L1-resident, zero allocator calls |
-| Small | 16 KiB to 256 KiB | `Vec<u8>` with `posix_fadvise(POSIX_FADV_SEQUENTIAL)` | Amortized syscall cost, doubled kernel read-ahead window |
-| Medium | 256 KiB to 4 MB | `pread` with aligned buffers | Avoids `mmap` page-fault overhead on sequential scans |
-| Large | > 4 MB | Chunked streaming read, 1 to 4 MB windows | Bypasses buffer cache, feeds scan engine without full materialization |
+| Tiny | `< 16 KiB` | stack buffer inline read | avoid heap allocation for very small files |
+| Small | `<= 256 KiB` | `Vec<u8>` full read | cheap full-file ownership for small payloads |
+| Large | `> 256 KiB` | `memmap2` mapping | hand the scan kernel a byte slice without copying the whole file |
 
-On Linux NVMe, `io_uring` batch `open+stat+read` replaces the per-file syscall sequence for directory traversal, reducing kernel-crossing overhead on the discovery critical path.
+These thresholds are current code constants, not aspirational tiers: `TINY_FILE_INLINE_LIMIT = 16 * 1024` and `SMALL_FILE_INLINE_LIMIT = 256 * 1024`.
 
 </details>
 
 <details>
-<summary><strong>Compiler profile</strong></summary>
+<summary><strong>Build profiles</strong></summary>
 
-The release profile is part of the performance contract. A source build with `target-cpu=native` will outperform distributed binaries on the target microarchitecture, as CI binaries are compiled against the runner's ISA, not the deployment host's.
+The repo currently defines one explicit performance-focused profile in `Cargo.toml`:
 
-| Flag | Effect | Observed Gain |
+| Profile | Setting | Effect |
 |---|---|---|
-| `lto = "fat"` | Whole-program optimization across crate boundaries | 10 to 20% |
-| `codegen-units = 1` | Single codegen unit, maximum inlining surface | Combined with LTO |
-| `target-cpu = "native"` | Enables AVX-512 and AVX2 intrinsics for the build host | 5 to 15% |
-| `panic = "abort"` | Removes unwind tables, smaller binary, improved icache density | Binary size + icache |
-| `strip = true` | Strips debug symbols from release binary | Instruction cache utilization |
-| PGO via `cargo-pgo` | Profile-guided branch probability data from real workloads | 2 to 15% additional |
+| `release-lto` | `lto = "fat"` | whole-program optimization across crate boundaries |
+| `release-lto` | `codegen-units = 1` | larger inlining surface and slower build, faster proof binary |
+
+Benchmark proof should always record the exact binary path it used instead of assuming a profile name or mutable `target/release/iex-cli.exe` state.
 
 </details>
 
@@ -383,6 +384,7 @@ cargo build --release -p iex-cli
 - `crates/iex-core/src/engine.rs` -- scan engine, concurrency planner, shard geometry
 - `crates/iex-core/src/expr.rs` -- expression lowering, fast-path machine classification
 - `.docs/iex-v2-crown-jewel.md` -- benchmark doctrine and promotion criteria
+- `.docs/project-distill-2026-04-22.md` -- current cold-start architecture and proof state
 
 ---
 

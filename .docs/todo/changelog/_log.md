@@ -3283,3 +3283,18 @@ Implemented the requested 3 targeted moves with minimal blast radius:
   - the motivating subtitle lane now collapses to the true match set (`candidate_lines_checked=39`, `candidate_lines_matched=39`) and is slightly ahead on median-of-three (`runId=1776862194340-e2847140`, `1776862197764-7afc8392`, `1776862201228-8e1d5632`)
   - the no-literal stress comparator remains fully inert from a decomposition perspective (`eligible_files=0`) but still shows binary-level instability on repeated proof (`runId=1776862210163-9026c4fe`, `1776862216979-a4d057ec`, `1776862223492-77b37068`)
   - conclusion: keep the candidate live; the next slice is no longer about candidate-line selectivity, it is about isolating inactive-lane variance before promotion
+
+## Docs sync for current regex architecture and benchmark governance - 2026-04-22 local
+- Scope:
+  - refreshed `README.md` to remove stale PCRE2 and old corpus-story claims and document the current Rust regex, byte-mode, benchmark-governance, and live-proof contract
+  - refreshed `.docs/iex-v2-crown-jewel.md` to point at the current distill, name regex decomposition telemetry explicitly, and add the active 2026-04-22 closure lane
+  - added `.docs/project-distill-2026-04-22.md` as the new cold-start snapshot and marked `.docs/project-distill-2026-04-21.md` as superseded
+- Validation:
+  - `cargo run -q -p iex-cli -- search --help`
+  - `cargo run -q -p iex-cli -- explain --help`
+  - `Get-Content tools\\reports\\latest.json`
+  - `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*bench-loop-suite.mjs*' } | Select-Object ProcessId,CommandLine`
+  - `iex search "lit:PCRE2" README.md .docs\\iex-v2-crown-jewel.md .docs\\project-distill-2026-04-22.md`
+- Result:
+  - canonical docs now describe the shipped engine contract: Rust `regex` plus `regex::bytes`, planner-owned regex decomposition, and immutable live-loop promotion proof
+  - the new handoff docs distinguish the active pinned loop binary from the unpromoted workspace candidate, which closes the current operator-doc drift
