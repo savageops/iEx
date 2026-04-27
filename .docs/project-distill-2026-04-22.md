@@ -1,5 +1,7 @@
 # iEx Project Distill - 2026-04-22
 
+> Superseded current snapshot: see [project-distill-2026-04-27.md](./project-distill-2026-04-27.md). This file is preserved as historical 2026-04-22 proof lineage and should not be treated as the current operator state.
+
 ## Mission Lock
 - iEx v2 remains a Rust search engine plus benchmark platform whose headline target is transparent proof that it can become at least `50%` faster than ripgrep on agreed workloads.
 - The repo doctrine is unchanged: no fake compatibility, no parallel ownership, no performance claims without exact binary-vs-binary proof, and no live-loop promotion without immutable evidence.

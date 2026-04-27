@@ -3298,3 +3298,14 @@ Implemented the requested 3 targeted moves with minimal blast radius:
 - Result:
   - canonical docs now describe the shipped engine contract: Rust `regex` plus `regex::bytes`, planner-owned regex decomposition, and immutable live-loop promotion proof
   - the new handoff docs distinguish the active pinned loop binary from the unpromoted workspace candidate, which closes the current operator-doc drift
+
+## 2026-04-27 - 111 documentation truth refresh
+
+- Resumed from the 110 latest-build versus installed native refresh and audited active README, architecture, distill, and benchmark-governance docs for stale `iex`/`iex-cli` current-state language.
+- Source of truth: `E:\Workspaces\01_Projects\01_Github\iEx\tools\reports\candidate-compare\110-ix-current-vs-installed-20260427-233905\summary.json`.
+- Updated `README.md` to prefer `ix explain`, document `ix-*.exe` snapshot naming, and surface the current Windows proof shape: `12/12` versus ripgrep, `9/12` versus installed predecessor, exact remaining losses on `suite-linux-no-literal` and `suite-linux-word`.
+- Added `E:\Workspaces\01_Projects\01_Github\iEx\.docs\project-distill-2026-04-27.md` as the current cold-start distill, with operator surface, benchmark truth, loss frontier, architecture truth, next proof blueprint, and documentation drift map.
+- Marked `E:\Workspaces\01_Projects\01_Github\iEx\.docs\project-distill-2026-04-22.md` as superseded historical proof lineage instead of rewriting it as current truth.
+- Updated `E:\Workspaces\01_Projects\01_Github\iEx\.docs\iex-v2-crown-jewel.md` so the current handoff points at the 2026-04-27 distill, active binary paths name `target/release/ix.exe`, live snapshot doctrine uses `ix-live-*.exe`, and the Windows contract names `%LOCALAPPDATA%\Programs\iEx\bin\ix.exe` as the current operator install.
+- Validation: `ix` search confirmed no active `Use \`iex explain\`` remains, no stale current handoff to `project-distill-2026-04-22.md` remains in the crown-jewel doc, and remaining `iex-cli-live` hits are inside explicitly archival history or the new drift note.
+- Follow-up correction: updated the crown-jewel Linux/macOS native path from `~/.local/bin/iex` to `~/.local/bin/ix` to match `tools/scripts/install-native.sh`.

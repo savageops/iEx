@@ -15,7 +15,7 @@ Primary objective:
 This document is the durable execution map for architecture, benchmarking, optimization, and quality gates.
 
 Current operational handoff:
-- Read [project-distill-2026-04-22.md](./project-distill-2026-04-22.md) first for the current benchmark-governance state, retained wins, rejected slices, and fresh-chat anchors.
+- Read [project-distill-2026-04-27.md](./project-distill-2026-04-27.md) first for the current benchmark-governance state, retained wins, rejected slices, and fresh-chat anchors.
 - Treat the long historical status notes later in this document as archival context; the dated distill is the current cold-start snapshot.
 
 ## 2) Canonical Architecture
@@ -81,7 +81,7 @@ Artifacts:
 - `tools/reports/bench/ripgrep-benchsuite-*.csv` (canonical external raw baseline from `npm run bench:report`)
 - `tools/reports/live-metrics.jsonl` (append-only live suite-loop diagnostics from `npm run bench:loop`)
 - `tools/reports/latest.json` (latest live run snapshot)
-- `tools/reports/candidate-compare/iex-cli-*.exe` (timestamped immutable baseline/candidate snapshots for exact binary replays)
+- `tools/reports/candidate-compare/ix-*.exe` (timestamped immutable baseline/candidate snapshots for exact binary replays; older `iex-cli-*.exe` snapshots remain historical proof lineage)
 - `tools/reports/candidate-compare/*.json` (candidate-vs-current proof artifacts, including active-loop promotion proofs)
 
 Run schema highlights:
@@ -101,7 +101,7 @@ Goal interpretation:
 - `iexMs` is engine-focused to isolate true search-core speed from process startup overhead.
 - `iexCliMs` keeps startup and argument parsing overhead visible for operator decisions.
 - Dashboard summaries must stay explicit that they are derived from live loop telemetry, not from the benchsuite CSV itself.
-- Benchmark scripts accept `--iex-binary <path>` so live loops, direct contender reruns, and one-shot diagnostics can replay an immutable binary snapshot without rebuilding `target/release/iex-cli.exe`.
+- Benchmark scripts accept `--iex-binary <path>` so live loops, direct contender reruns, and one-shot diagnostics can replay an immutable binary snapshot without rebuilding `target/release/ix.exe`.
 - Benchmark scripts also accept `--previous-iex-binary <path>` so the dashboard can render current-vs-previous iEx ratios in the same live competitor lane model used for ripgrep, without letting the previous build replace the external challenger heuristics.
 
 Live comparator flow snapshot:
@@ -122,7 +122,7 @@ Live comparator flow snapshot:
 1. Identify the exact binary path currently driving the live suite loop.
 2. Compare the candidate against that exact binary on the full suite with interleaved multi-pair samples, not a one-profile spot check.
 3. Promote only when the suite-level proof shows a real gain signal rather than a one-off lane win.
-4. Copy the promoted binary to a timestamped immutable `iex-cli-live-*.exe` snapshot and restart the loop with `--iex-binary <snapshot>`.
+4. Copy the promoted binary to a timestamped immutable `ix-live-*.exe` snapshot and restart the loop with `--iex-binary <snapshot>`.
 5. Verify `tools/reports/latest.json` reports that promoted snapshot path so the dashboard is reading the new loop, not stale history.
 
 ## 5) Quality System
@@ -146,12 +146,20 @@ Live comparator flow snapshot:
 Native command ownership matters because iEx should be reachable as a first-class system search tool, not only as a repo-local build artifact.
 
 Windows contract:
-- native install path: `%LOCALAPPDATA%\Programs\iEx\bin\iex.exe`
-- profile contract: installer must remove the built-in PowerShell `iex` alias and remap `iex` to the native binary in the current user's host profile
+- native install path: `%LOCALAPPDATA%\Programs\iEx\bin\ix.exe`
+- profile contract: installer must expose `ix` as the first-class operator command without colliding with the built-in PowerShell `iex` alias
 - path contract: installer must add the install directory to the user `PATH`
 
+Latest Windows proof refresh:
+- authoritative artifact: `tools/reports/candidate-compare/110-ix-current-vs-installed-20260427-233905/summary.json`
+- current build: `target/release/ix.exe`
+- installed predecessor comparator: `C:\Users\Savage\AppData\Local\Programs\iEx\bin\iex.exe`
+- suite shape: `12/12` wins versus ripgrep and `9/12` wins versus the installed predecessor on the three-sample dashboard suite
+- exact focused recheck: `suite-en-alternates` is green at `0.9678677341x` versus installed; confirmed predecessor-loss frontier is `suite-linux-no-literal` at `1.0973882236x` and `suite-linux-word` at `1.0285681917x`
+- cost center: Linux scan lanes with `144,017,913` dominant targeted bytes, `0` dominant activated files, inactive sharding, and tail-heavy AMD ASIC register headers
+
 macOS / Linux contract:
-- native install path: `~/.local/bin/iex`
+- native install path: `~/.local/bin/ix`
 - shell contract: installer must ensure `~/.local/bin` is exported in the common login shell profiles without duplicate blocks
 
 Script ownership:
@@ -194,6 +202,9 @@ Release artifact rule:
 2. preserve append-only `SearchStats.regex_decomposition` attribution so proof can distinguish active wins, bailouts, and inert unsupported lanes
 3. use planner-owned local context gates and candidate-line bailouts to reduce false-positive work before line-boundary recovery
 4. do not promote the workspace candidate into the live loop until full-suite proof versus the exact pinned loop binary is neutral or better
+5. keep `linux_strategy` / `linuxStrategy` as proof context only for now; the 2026-04-22 single-root selector candidate was rejected after immutable Linux proof, so the next active runtime parent is `025` giant-file Linux tail closure
+6. treat `linux_dominant_file` / `linuxDominantFile` as proof context only for now; the 2026-04-22 Linux giant-file parent ended non-promotable after full four-lane proof
+7. the direct `regex-automata` recovered-line anchored one-pass verifier parent is also now closed as non-promotable; the `024` proof stayed materially slower than the pinned clean binary even on a supported counted corpus, so the next parent must be re-priced from fresh weak-lane evidence instead of inheriting that verifier seam
 
 ### Rules of engagement
 - no workaround paths
@@ -289,7 +300,7 @@ Operator contract chain:
 - `008f` verification and closeout
 
 Historical benchmark status snapshots (archival context):
-- Current live truth now lives in `project-distill-2026-04-22.md`, `tools/reports/latest.json`, and `tools/reports/live-metrics.jsonl`.
+- Current live truth now lives in `project-distill-2026-04-27.md`, `tools/reports/latest.json`, and `tools/reports/live-metrics.jsonl`.
 - The bullets below are preserved as implementation history and proof lineage, not as the current dashboard headline.
 - latest default profile loop is consistently above 50% speedup for `iexMs` (engine metric).
 - CLI wall-time overhead remains tracked and is an active optimization target.
@@ -348,6 +359,9 @@ Historical benchmark status snapshots (archival context):
 - the first full-suite proof keeps the doctrine honest instead of overpromoting the slice: immutable artifact `tools/reports/candidate-compare/planner-phase1-vs-threads90-suite-compare-2026-04-11t21-42-38-019z.json` shows dramatic EN wins on the single-file shard-safe lanes (`suite-en-alternates` `+28.66%`, `suite-en-literal-casei` `+24.68%`, `suite-en-literal` `+16.73%`) and clean telemetry for the chosen plans, but the full 12-profile median is still slightly behind the current `threads90` candidate (`271.7086 ms` to `272.7053 ms`, `-0.37%`) because three Linux tree lanes regressed. That makes the planner architecture real and valuable, but not yet promotion-grade for the active suite.
 - the April 12 re-check updates the strategic read again: the earlier "008c multipath-first" suspicion is now secondary rather than primary. `tools/reports/latest.json` is pinned to immutable candidate `tools/reports/candidate-compare/iex-cli-candidate-threads90-20260411-201130.exe`, the current suite-style loop feed shows that binary ahead of ripgrep across the sampled Linux and subtitle lanes, and the strongest current code delta lives in materialized-path concurrency plus file-local sharding rather than in streaming discovery alone. The remaining streaming gate issue is still real because `should_stream_stats_only(...)` keys off `input_roots > 1`, but the higher-value frontier is now Linux tree stability and collect-hits parity on top of the `threads90` floor, not another broad scheduler rewrite.
 - that same re-check also keeps the proof contract honest: `tools/scripts/lib/benchmark-runner.mjs` still benchmarks `iex search ... --json --stats-only`, so live-loop wins remain stats-only wins until they are mirrored on collect-hits workloads. The correct next move is therefore narrow and measurable: keep planner work constrained to lanes that beat `threads90`, widen proof beyond best-of-3 when promotion claims matter, and avoid letting the older Sherlock-centric multipath gap drag the roadmap away from the now-winning materialized path.
+- the capped collect-hits lane now has its own proof-grade win instead of inheriting stats-only optimism: `engine.rs` threads `SearchConfig::max_hits` into materialized and prepared scans, keeps counting every matching line, and stops constructing retained `SearchHit` objects after each file has enough local hits to satisfy the final global cap. Proof artifact `tools/reports/candidate-compare/051-max-hit-candidate-proof-2026-04-24T01-58-09-074Z.json` shows the candidate at `337.0749 ms` median total versus pre-051 snapshot `876.7887 ms` and installed native `923.1046 ms` on `lit:the || lit:and || lit:Holmes || lit:Watson --max-hits 10`, with identical `1,099,790` matches, `10` hits, first hit column `15`, and last retained hit line `68`.
+- the follow-on multi-file capped-hit proof now closes the aggregation side of the same contract: `merge_outcome` receives `max_hits`, `merge_hits` keeps only the globally earliest retained hits under the cap, and final output ordering remains path/line/column. Proof artifact `tools/reports/candidate-compare/052-global-max-hit-candidate-proof-2026-04-24T02-12-04-059Z.json` shows `lit:if` on the Linux corpus improving from pre-052 `1133.2783 ms` to candidate `959.4368 ms` and installed native `2341.235 ms`, while aggregate median fell from `344.3711 ms` to `150.1793 ms` against the snapshot with identical `2,219,280` matches and `10` retained hits.
+- the retained `078` replay trims a real double-scan tax from case-sensitive plain regex literals without opening a new engine path: `RegexFastPath::PlainLiteral` now omits `RejectFastGate`, while case-insensitive literals and alternates keep their gates. Proof artifact `tools/reports/candidate-compare/078-reject-fast-strong-replay-proof-2026-04-24T18-41-38-774Z.json` shows `re:PM_RESUME` improving versus installed native at ratio `0.9773` with `39/39/39` match parity; the initially suspicious direct-literal guard was rechecked in `tools/reports/candidate-compare/078-direct-literal-guard-recheck-2026-04-24T18-44-44-583Z.json` and passed at candidate/snapshot `0.9734`, candidate/installed `0.9671`.
 
 ## 9) Operating Doctrine
 
@@ -355,3 +369,5 @@ Historical benchmark status snapshots (archival context):
 - measurable progress over speculative complexity
 - independent iEx implementation inspired by harvested patterns, not copy-paste architecture drift
 - objective truth lives in command outputs, telemetry artifacts, and explicit tests
+- performance candidates must pass the full retention lifecycle before promotion: snapshot baseline, exact current-vs-installed proof, smallest removable probe, focused tests, repeated interleaved benchmarks, telemetry activation, adjacent-lane guards, and durable retain/reject evidence
+- deep research is hypothesis generation only; worse-than-current candidates are reverted even if they beat installed native once, and rejected variants must record the failed mechanism plus the next lower-level mechanism instead of becoming dead-end noise
