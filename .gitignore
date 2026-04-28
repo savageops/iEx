@@ -5,8 +5,14 @@
 /tools/data/corpus/
 .DS_Store
 Thumbs.db
+
+# Private operator state, research scratchpads, transcripts, and local harnesses.
 /.docs
 /.harness
+/.rips
+/.research
+/.transcripts
+/.private
 /tests
 /todo
 /tools
