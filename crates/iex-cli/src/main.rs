@@ -26,9 +26,13 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    #[command(about = "Full search report and summary")]
     Search(SearchArgs),
+    #[command(about = "Hit records only, same search engine")]
     Matches(SearchArgs),
+    #[command(about = "Read-only file windows and match context")]
     Inspect(InspectArgs),
+    #[command(about = "Expression plan JSON")]
     Explain(ExplainArgs),
 }
 
@@ -46,5 +50,32 @@ fn dispatch_command(command: Command) -> Result<()> {
         Command::Matches(args) => run_matches_command(args),
         Command::Inspect(args) => run_inspect_command(args),
         Command::Explain(args) => run_explain_command(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn top_level_help_names_command_contracts() {
+        let mut command = Cli::command();
+        let mut help = Vec::new();
+        command
+            .write_long_help(&mut help)
+            .expect("top-level help should render");
+        let help = String::from_utf8(help).expect("help should be UTF-8");
+
+        assert!(help.contains("search"));
+        assert!(help.contains("Full search report and summary"));
+        assert!(help.contains("matches"));
+        assert!(help.contains("Hit records only, same search engine"));
+        assert!(help.contains("inspect"));
+        assert!(help.contains("Read-only file windows and match context"));
+        assert!(help.contains("explain"));
+        assert!(help.contains("Expression plan JSON"));
+        assert!(help.contains("expr: lit:text | re:pattern | prefix:x | suffix:x"));
+        assert!(help.contains("ix inspect src/main.rs --range 40:80"));
     }
 }
