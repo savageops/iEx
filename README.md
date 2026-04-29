@@ -1,6 +1,6 @@
 <div align="center">
 
-# IX
+# Intelligent {Expressions}
 
 **Rust search CLI and benchmark platform with workload-aware execution and proof-first performance governance.**
 
