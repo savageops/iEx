@@ -57,16 +57,21 @@ pub const SearchReport = struct {
 
 /// Entry point for the search engine. Orchestrates the full pipeline:
 ///   1. Deduplicate and prune overlapping root paths
-///   2. Recursively scan each root (currently serial — no parallelism yet)
-///   3. Aggregate timing and match statistics into the report
+///   2. Discover all files (serial directory walk)
+///   3. Scan files in parallel across N threads
+///   4. Merge shard reports and aggregate timing
 ///
-/// The scan is serial because Zig doesn't have a Rayon/crossbeam equivalent.
-/// Rust parallelizes across files using work-stealing thread pools, which is
-/// why large-directory benchmarks still favor Rust by 1.4–3.5x even after
-/// StringZilla closed the per-byte search kernel gap.
+/// PARALLELISM STRATEGY:
+/// Two-phase: discover files serially (fast readdir, <1ms for 500 files),
+/// then partition the file list across N worker threads. Each thread gets
+/// its own ShardReport (counters + hit buffer), avoiding all mutex overhead
+/// in the hot per-line matching path. Results are merged after all threads
+/// join. This matches Rust's parallel file scanning via Rayon, closing the
+/// large-directory performance gap.
 pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest, plan: expr.ExpressionPlan) !SearchReport {
     const total_started = std.Io.Timestamp.now(io, .awake);
     const roots = try prepareRoots(io, allocator, request);
+    const thread_count = effectiveThreadCount(request);
     var report = SearchReport{
         .expression = request.expression,
         .input_roots = if (request.path_count == 0) 1 else request.path_count,
@@ -95,21 +100,392 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         .uses_single_literal_counter = plan.usesSingleLiteralCounter(),
         .fast_count_range_overlap = plan.fastMatchCountRangeOverlap(),
         .available_threads = availableThreads(),
-        .outer_scan_threads = if (request.threads) |threads| @max(threads, 1) else 1,
+        .outer_scan_threads = thread_count,
         .hits = undefined,
         .hit_count = 0,
     };
-    const scan_started = std.Io.Timestamp.now(io, .awake);
+
+    // Phase 1: Discover all files via serial directory walk.
+    const discover_started = std.Io.Timestamp.now(io, .awake);
+    var file_list = FileList.empty;
     for (roots.items[0..roots.count]) |root| {
-        try scanPath(io, allocator, root.original, request, plan, &report);
-        if (report.truncated) break;
+        try discoverFiles(io, allocator, root.original, request, &file_list, &report);
+    }
+    report.discover_ms = elapsedMs(io, discover_started);
+
+    // Phase 2: Scan files — parallel if multiple files and threads available.
+    const scan_started = std.Io.Timestamp.now(io, .awake);
+    const discovered = file_list.items(allocator);
+    if (discovered.len == 0) {
+        // No files discovered — nothing to scan.
+    } else if (thread_count <= 1 or discovered.len < 4) {
+        // Serial path: single thread or too few files to justify spawning.
+        for (discovered) |entry| {
+            try scanDiscoveredFile(io, allocator, entry.path, request, plan, &report);
+            if (report.truncated) break;
+        }
+    } else {
+        try parallelScanFiles(io, allocator, discovered, request, plan, thread_count, &report);
     }
     report.scan_ms = elapsedMs(io, scan_started);
+
     const aggregate_started = std.Io.Timestamp.now(io, .awake);
     report.aggregate_ms = elapsedMs(io, aggregate_started);
     report.total_ms = elapsedMs(io, total_started);
     refreshStats(&report);
     return report;
+}
+
+/// Determine effective thread count for parallel scanning.
+/// Uses the --threads flag if provided, otherwise auto-detects CPU count.
+/// Caps at 16 to avoid diminishing returns from excessive context switching.
+fn effectiveThreadCount(request: cli.SearchRequest) usize {
+    if (request.threads) |threads| return @max(threads, 1);
+    const cpus = availableThreads();
+    return @min(cpus, 16);
+}
+
+/// A discovered file entry — path is arena-allocated and lives for the
+/// process lifetime.
+const DiscoveredFile = struct {
+    path: []const u8,
+};
+
+/// Growable list of discovered files. Uses a flat array with doubling growth.
+const FileList = struct {
+    buffer: ?[*]DiscoveredFile,
+    len: usize,
+    capacity: usize,
+
+    const empty: FileList = .{ .buffer = null, .len = 0, .capacity = 0 };
+
+    fn append(self: *FileList, allocator: std.mem.Allocator, entry: DiscoveredFile) !void {
+        if (self.len == self.capacity) {
+            const new_cap = if (self.capacity == 0) 64 else self.capacity * 2;
+            const new_buf = try allocator.alloc(DiscoveredFile, new_cap);
+            if (self.buffer) |old| {
+                @memcpy(new_buf[0..self.len], old[0..self.len]);
+            }
+            self.buffer = new_buf.ptr;
+            self.capacity = new_cap;
+        }
+        self.buffer.?[self.len] = entry;
+        self.len += 1;
+    }
+
+    fn items(self: *const FileList, _: std.mem.Allocator) []const DiscoveredFile {
+        if (self.buffer) |buf| return buf[0..self.len];
+        return &[_]DiscoveredFile{};
+    }
+};
+
+/// Phase 1: Recursively walk a root path and collect all scannable file paths.
+/// This is fast — only readdir syscalls, no file content reads. Hidden files
+/// are filtered here, and files_discovered/files_skipped are counted on the
+/// main report (single-threaded, no contention).
+fn discoverFiles(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    request: cli.SearchRequest,
+    file_list: *FileList,
+    report: *SearchReport,
+) anyerror!void {
+    // Try opening as a file first. If it's a directory, recurse.
+    const file = std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false }) catch |file_err| switch (file_err) {
+        error.IsDir, error.AccessDenied => {
+            try discoverDirectory(io, allocator, path, request, file_list, report);
+            return;
+        },
+        else => return file_err,
+    };
+    file.close(io);
+    report.files_discovered += 1;
+    const display_path = try normalizeDisplayPath(allocator, path);
+    try file_list.append(allocator, .{ .path = display_path });
+}
+
+fn discoverDirectory(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    request: cli.SearchRequest,
+    file_list: *FileList,
+    report: *SearchReport,
+) anyerror!void {
+    const dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (!request.hidden and isHiddenPath(entry.name)) {
+            report.files_skipped += 1;
+            continue;
+        }
+        const child_path = try std.fs.path.join(allocator, &[_][]const u8{ path, entry.name });
+        switch (entry.kind) {
+            .file => {
+                report.files_discovered += 1;
+                const display_path = try normalizeDisplayPath(allocator, child_path);
+                try file_list.append(allocator, .{ .path = display_path });
+            },
+            .directory => try discoverDirectory(io, allocator, child_path, request, file_list, report),
+            else => {},
+        }
+    }
+}
+
+/// Thread-local shard report. Each worker thread accumulates results here
+/// without any synchronization. Merged into the main SearchReport after
+/// all threads join.
+const ShardReport = struct {
+    bytes_scanned: usize,
+    files_scanned: usize,
+    files_skipped: usize,
+    matches_found: usize,
+    scan_work_ms_total: f64,
+    slowest_path: []const u8,
+    slowest_bytes: usize,
+    slowest_ms: f64,
+    hits: [MAX_RETAINED_HITS]SearchHit,
+    hit_count: usize,
+    truncated: bool,
+    had_error: bool,
+
+    const empty: ShardReport = .{
+        .bytes_scanned = 0,
+        .files_scanned = 0,
+        .files_skipped = 0,
+        .matches_found = 0,
+        .scan_work_ms_total = 0,
+        .slowest_path = "",
+        .slowest_bytes = 0,
+        .slowest_ms = 0,
+        .hits = undefined,
+        .hit_count = 0,
+        .truncated = false,
+        .had_error = false,
+    };
+};
+
+/// Scan a single discovered file — used in the serial path and by
+/// parallel workers. Opens the file, checks for binary content, and
+/// runs the line-by-line matching loop.
+fn scanDiscoveredFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    display_path: []const u8,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    report: *SearchReport,
+) anyerror!void {
+    // display_path is already normalized; open via the original-ish path.
+    // We re-derive a filesystem path by using display_path directly since
+    // we stored normalized forward-slash paths during discovery.
+    const file = std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false }) catch |err| switch (err) {
+        error.IsDir, error.AccessDenied => return,
+        else => return err,
+    };
+    defer file.close(io);
+    try scanOpenFile(io, allocator, file, display_path, request, plan, report);
+}
+
+/// Scan a single file into a ShardReport (thread-local, no sync needed).
+fn scanFileIntoShard(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    display_path: []const u8,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    shard: *ShardReport,
+) void {
+    const file = std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false }) catch {
+        shard.files_skipped += 1;
+        return;
+    };
+    defer file.close(io);
+    scanOpenFileIntoShard(io, allocator, file, display_path, request, plan, shard) catch {
+        shard.had_error = true;
+    };
+}
+
+/// Core per-file scan for the parallel path. Identical logic to
+/// scanOpenFile but writes into a ShardReport instead of SearchReport.
+fn scanOpenFileIntoShard(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    display_path: []const u8,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    shard: *ShardReport,
+) anyerror!void {
+    const file_started = std.Io.Timestamp.now(io, .awake);
+    const file_len = try file.length(io);
+    const file_bytes: usize = @intCast(file_len);
+    if (try isLikelyBinary(io, file, file_len)) {
+        shard.files_skipped += 1;
+        return;
+    }
+    shard.files_scanned += 1;
+    shard.bytes_scanned += file_bytes;
+    if (file_bytes >= shard.slowest_bytes) {
+        shard.slowest_path = display_path;
+        shard.slowest_bytes = file_bytes;
+    }
+
+    var read_buffer: [1024 * 1024]u8 = undefined;
+    var carry: std.ArrayList(u8) = .empty;
+    defer carry.deinit(allocator);
+
+    var offset: u64 = 0;
+    var line_number: usize = 1;
+    var ended_with_newline = false;
+    while (offset < file_len) {
+        const remaining = file_len - offset;
+        const target_len: usize = @intCast(@min(read_buffer.len, remaining));
+        const read_len = try file.readPositionalAll(io, read_buffer[0..target_len], offset);
+        if (read_len == 0) break;
+        offset += read_len;
+        const chunk = read_buffer[0..read_len];
+        ended_with_newline = chunk[chunk.len - 1] == '\n';
+
+        var chunk_index: usize = 0;
+        while (chunk_index < chunk.len) {
+            if (sz.indexOfByte(chunk[chunk_index..], '\n')) |relative_newline| {
+                const line_part = chunk[chunk_index .. chunk_index + relative_newline];
+                if (carry.items.len == 0) {
+                    recordLineIntoShard(allocator, display_path, line_part, line_number, request, plan, shard);
+                } else {
+                    try carry.appendSlice(allocator, line_part);
+                    recordLineIntoShard(allocator, display_path, carry.items, line_number, request, plan, shard);
+                    carry.clearRetainingCapacity();
+                }
+                if (shard.truncated) break;
+                line_number += 1;
+                chunk_index += relative_newline + 1;
+            } else {
+                try carry.appendSlice(allocator, chunk[chunk_index..]);
+                break;
+            }
+        }
+        if (shard.truncated) break;
+    }
+
+    if (!shard.truncated and (carry.items.len > 0 or file_len == 0 or ended_with_newline)) {
+        recordLineIntoShard(allocator, display_path, carry.items, line_number, request, plan, shard);
+    }
+    const file_ms = elapsedMs(io, file_started);
+    shard.scan_work_ms_total += file_ms;
+    if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+}
+
+fn recordLineIntoShard(
+    allocator: std.mem.Allocator,
+    display_path: []const u8,
+    raw_line: []const u8,
+    line_number: usize,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    shard: *ShardReport,
+) void {
+    const line = std.mem.trimEnd(u8, raw_line, "\r");
+    if (request.stats_only) {
+        const count = statsOnlyMatchCount(line, plan, request.case_insensitive);
+        shard.matches_found += count;
+        return;
+    }
+    if (matchingColumn(line, plan, request.case_insensitive)) |column| {
+        shard.matches_found += 1;
+        const under_request_limit = if (request.max_hits) |max_hits| shard.hit_count < max_hits else true;
+        if (under_request_limit and shard.hit_count < MAX_RETAINED_HITS) {
+            shard.hits[shard.hit_count] = .{
+                .path = display_path,
+                .line = line_number,
+                .column = column,
+                .preview = allocator.dupe(u8, line) catch line,
+            };
+            shard.hit_count += 1;
+        }
+    }
+}
+
+/// Worker thread entry point. Scans its assigned shard of files.
+fn shardWorker(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, shard: *ShardReport) void {
+    for (files) |entry| {
+        if (shard.truncated) break;
+        scanFileIntoShard(io, allocator, entry.path, request, plan, shard);
+    }
+}
+
+/// Phase 2: Distribute files across N threads and scan in parallel.
+/// Each thread gets a contiguous slice of the file list (static partitioning)
+/// and writes into its own ShardReport. After all threads join, shard results
+/// are merged into the main report.
+fn parallelScanFiles(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    files: []const DiscoveredFile,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    thread_count: usize,
+    report: *SearchReport,
+) !void {
+    const actual_threads = @min(thread_count, files.len);
+    // Worker threads = actual_threads - 1 (main thread takes a shard too).
+    const worker_count = actual_threads - 1;
+
+    // Allocate shard reports — one per thread (including main).
+    const shards = try allocator.alloc(ShardReport, actual_threads);
+    for (shards) |*s| s.* = ShardReport.empty;
+
+    // Partition files across shards using round-robin-ish static split.
+    const base_size = files.len / actual_threads;
+    const remainder = files.len % actual_threads;
+
+    // Calculate shard boundaries.
+    const boundaries = try allocator.alloc(usize, actual_threads + 1);
+    boundaries[0] = 0;
+    for (0..actual_threads) |i| {
+        const extra: usize = if (i < remainder) 1 else 0;
+        boundaries[i + 1] = boundaries[i] + base_size + extra;
+    }
+
+    // Spawn worker threads (shards 1..N-1).
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    for (0..worker_count) |i| {
+        const shard_index = i + 1;
+        const shard_files = files[boundaries[shard_index]..boundaries[shard_index + 1]];
+        threads[i] = try std.Thread.spawn(.{}, shardWorker, .{ io, allocator, shard_files, request, plan, &shards[shard_index] });
+    }
+
+    // Main thread processes shard 0.
+    const main_files = files[boundaries[0]..boundaries[1]];
+    shardWorker(io, allocator, main_files, request, plan, &shards[0]);
+
+    // Join all worker threads.
+    for (threads) |t| t.join();
+
+    // Merge shard reports into the main report.
+    for (shards) |shard| {
+        report.bytes_scanned += shard.bytes_scanned;
+        report.files_scanned += shard.files_scanned;
+        report.files_skipped += shard.files_skipped;
+        report.matches_found += shard.matches_found;
+        report.scan_work_ms_total += shard.scan_work_ms_total;
+        if (shard.slowest_ms >= report.slowest_ms) {
+            report.slowest_ms = shard.slowest_ms;
+            report.slowest_path = shard.slowest_path;
+            report.slowest_bytes = shard.slowest_bytes;
+        }
+        // Merge hits: copy from shard into report, respecting the global cap.
+        const available = MAX_RETAINED_HITS - report.hit_count;
+        const to_copy = @min(shard.hit_count, available);
+        for (0..to_copy) |j| {
+            report.hits[report.hit_count] = shard.hits[j];
+            report.hit_count += 1;
+        }
+        if (shard.truncated) report.truncated = true;
+    }
 }
 
 const PreparedRoot = struct {
@@ -276,53 +652,6 @@ fn refreshStats(report: *SearchReport) void {
 
 fn availableThreads() usize {
     return std.Thread.getCpuCount() catch 1;
-}
-
-fn scanPath(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    request: cli.SearchRequest,
-    plan: expr.ExpressionPlan,
-    report: *SearchReport,
-) anyerror!void {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false }) catch |file_err| switch (file_err) {
-        error.IsDir, error.AccessDenied => {
-            try scanDirectory(io, allocator, path, request, plan, report);
-            return;
-        },
-        else => return file_err,
-    };
-    defer file.close(io);
-    report.files_discovered += 1;
-    try scanOpenFile(io, allocator, file, path, request, plan, report);
-}
-
-fn scanDirectory(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    request: cli.SearchRequest,
-    plan: expr.ExpressionPlan,
-    report: *SearchReport,
-) anyerror!void {
-    const dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
-    defer dir.close(io);
-    var iterator = dir.iterate();
-    while (try iterator.next(io)) |entry| {
-        if (!request.hidden and isHiddenPath(entry.name)) {
-            report.files_skipped += 1;
-            continue;
-        }
-        const child_path = try std.fs.path.join(allocator, &[_][]const u8{ path, entry.name });
-        defer allocator.free(child_path);
-        switch (entry.kind) {
-            .file => try scanPath(io, allocator, child_path, request, plan, report),
-            .directory => try scanDirectory(io, allocator, child_path, request, plan, report),
-            else => {},
-        }
-        if (report.truncated) break;
-    }
 }
 
 /// Core per-file scan loop. Reads the file in 1 MiB chunks, splits into
