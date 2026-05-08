@@ -485,7 +485,7 @@ fn statsOnlyMatchCount(line: []const u8, plan: expr.ExpressionPlan, case_insensi
 fn predicateMatchCount(line: []const u8, predicate: expr.Predicate, case_insensitive: bool) usize {
     return switch (predicate.kind) {
         .literal => countLiteral(line, predicate.value, case_insensitive),
-        .regex => countRegexStatsOnly(line, predicate.value, case_insensitive),
+        .regex => predicateMatchCountByStrategy(line, predicate, case_insensitive),
         .prefix, .suffix => if (predicateMatches(line, predicate, case_insensitive)) 1 else 0,
     };
 }
@@ -495,6 +495,32 @@ fn countRegexStatsOnly(line: []const u8, pattern: []const u8, case_insensitive: 
         return if (regex.column(line, pattern, case_insensitive) != null) 1 else 0;
     }
     return regex.count(line, pattern, case_insensitive);
+}
+
+fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool) usize {
+    return switch (predicate.strategy) {
+        .regex_plain_literal => countLiteral(line, predicate.value, case_insensitive),
+        .regex_ascii_casefold_literal => blk: {
+            const body = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            break :blk countLiteral(line, body, true);
+        },
+        .regex_word_boundary_literal => if (wordBoundaryLiteralColumn(line, stripWordBoundaryAnchors(predicate.value), case_insensitive) != null) 1 else 0,
+        .regex_ascii_casefold_word_boundary_literal => blk: {
+            const after_flag = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            break :blk if (wordBoundaryLiteralColumn(line, stripWordBoundaryAnchors(after_flag), true) != null) 1 else 0;
+        },
+        .regex_literal_alternates => if (literalAlternatesColumn(line, predicate.value, case_insensitive) != null) 1 else 0,
+        else => countRegexWithPrefilter(line, predicate.value, case_insensitive),
+    };
+}
+
+fn countRegexWithPrefilter(line: []const u8, pattern: []const u8, case_insensitive: bool) usize {
+    const effective_pattern = if (std.mem.startsWith(u8, pattern, "(?i)")) pattern[4..] else pattern;
+    const prefix = extractLiteralPrefix(effective_pattern);
+    if (prefix.len >= 2) {
+        if (indexOfLiteral(line, prefix, case_insensitive) == null) return 0;
+    }
+    return countRegexStatsOnly(line, pattern, case_insensitive);
 }
 
 fn isSurroundingWordLiteralPattern(pattern: []const u8) bool {
@@ -573,7 +599,74 @@ fn predicateColumn(line: []const u8, predicate: expr.Predicate, case_insensitive
         .literal => if (indexOfLiteral(line, predicate.value, case_insensitive)) |index| index + 1 else null,
         .prefix => if (startsWithLiteral(line, predicate.value, case_insensitive)) 1 else null,
         .suffix => if (endsWithLiteral(line, predicate.value, case_insensitive)) line.len - predicate.value.len + 1 else null,
-        .regex => regex.column(line, predicate.value, case_insensitive),
+        .regex => regexColumnByStrategy(line, predicate, case_insensitive),
+    };
+}
+
+/// Strategy-aware regex dispatch. The expression parser classifies regex
+/// patterns into strategy tiers (see expr.MatcherStrategy). Patterns that
+/// are structurally literals (e.g. `re:(?i)sherlock` → casefold literal)
+/// bypass the recursive backtracking engine and use StringZilla-backed
+/// literal search instead. Only `regex_full` falls through to the regex.
+fn regexColumnByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool) ?usize {
+    return switch (predicate.strategy) {
+        .regex_plain_literal => {
+            const index = indexOfLiteral(line, predicate.value, case_insensitive) orelse return null;
+            return index + 1;
+        },
+        .regex_ascii_casefold_literal => {
+            const body = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            const index = indexOfLiteral(line, body, true) orelse return null;
+            return index + 1;
+        },
+        .regex_word_boundary_literal => {
+            const body = stripWordBoundaryAnchors(predicate.value);
+            return wordBoundaryLiteralColumn(line, body, case_insensitive);
+        },
+        .regex_ascii_casefold_word_boundary_literal => {
+            const after_flag = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            const body = stripWordBoundaryAnchors(after_flag);
+            return wordBoundaryLiteralColumn(line, body, true);
+        },
+        .regex_literal_alternates => {
+            return literalAlternatesColumn(line, predicate.value, case_insensitive);
+        },
+        else => regexWithLiteralPrefilter(line, predicate.value, case_insensitive),
+    };
+}
+
+/// For regex_full patterns, extract the literal prefix (if any) and use
+/// StringZilla to reject lines that can't match before running the regex.
+/// E.g. `process_\d+_\d+` has literal prefix `process_` — lines without
+/// it are skipped entirely. This avoids the recursive backtracking cost
+/// on the ~90% of lines that don't contain the prefix.
+fn regexWithLiteralPrefilter(line: []const u8, pattern: []const u8, case_insensitive: bool) ?usize {
+    const effective_pattern = if (std.mem.startsWith(u8, pattern, "(?i)")) pattern[4..] else pattern;
+    const prefix = extractLiteralPrefix(effective_pattern);
+    if (prefix.len >= 2) {
+        if (indexOfLiteral(line, prefix, case_insensitive) == null) return null;
+    }
+    return regex.column(line, pattern, case_insensitive);
+}
+
+/// Extract the leading literal bytes from a regex pattern, stopping at
+/// the first metacharacter or escape sequence. Returns an empty slice
+/// if the pattern starts with a metacharacter.
+fn extractLiteralPrefix(pattern: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < pattern.len) {
+        const byte = pattern[end];
+        if (byte == '\\') break; // escape sequence — not a plain literal
+        if (isRegexMetaChar(byte)) break;
+        end += 1;
+    }
+    return pattern[0..end];
+}
+
+fn isRegexMetaChar(byte: u8) bool {
+    return switch (byte) {
+        '.', '*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '^', '$' => true,
+        else => false,
     };
 }
 
@@ -643,4 +736,60 @@ fn literalEquals(left: []const u8, right: []const u8, case_insensitive: bool) bo
 fn byteEquals(left: u8, right: u8, case_insensitive: bool) bool {
     if (!case_insensitive) return left == right;
     return std.ascii.toLower(left) == std.ascii.toLower(right);
+}
+
+/// Strip `\b` anchors from both ends of a word-boundary pattern.
+/// E.g. `\bsession\b` → `session`. Caller has already verified
+/// the pattern is classified as regex_word_boundary_literal.
+fn stripWordBoundaryAnchors(pattern: []const u8) []const u8 {
+    var body = pattern;
+    if (body.len >= 2 and body[0] == '\\' and body[1] == 'b') body = body[2..];
+    if (body.len >= 2 and body[body.len - 2] == '\\' and body[body.len - 1] == 'b') body = body[0 .. body.len - 2];
+    return body;
+}
+
+/// Search for a literal at a word boundary. Finds the literal via
+/// indexOfLiteral, then verifies that both edges sit at word boundaries
+/// (transition between \w and \W or string edge). Returns 1-based column.
+fn wordBoundaryLiteralColumn(line: []const u8, needle: []const u8, case_insensitive: bool) ?usize {
+    if (needle.len == 0) return null;
+    var start: usize = 0;
+    while (start + needle.len <= line.len) {
+        const index = indexOfLiteral(line[start..], needle, case_insensitive) orelse return null;
+        const abs = start + index;
+        const left_is_word = abs > 0 and isWordChar(line[abs - 1]);
+        const right_is_word = (abs + needle.len) < line.len and isWordChar(line[abs + needle.len]);
+        const first_is_word = isWordChar(needle[0]);
+        const last_is_word = isWordChar(needle[needle.len - 1]);
+        const left_ok = left_is_word != first_is_word or abs == 0;
+        const right_ok = right_is_word != last_is_word or (abs + needle.len) == line.len;
+        if (left_ok and right_ok) return abs + 1;
+        start = abs + 1;
+    }
+    return null;
+}
+
+fn isWordChar(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+/// Search for a top-level literal alternation pattern like `TODO|FIXME`.
+/// Each branch is a plain literal — search them individually and return
+/// the earliest match column.
+fn literalAlternatesColumn(line: []const u8, pattern: []const u8, case_insensitive: bool) ?usize {
+    var best: ?usize = null;
+    var start: usize = 0;
+    while (start <= pattern.len) {
+        const end = std.mem.indexOfScalarPos(u8, pattern, start, '|') orelse pattern.len;
+        const branch = pattern[start..end];
+        if (branch.len > 0) {
+            if (indexOfLiteral(line, branch, case_insensitive)) |index| {
+                const col = index + 1;
+                if (best == null or col < best.?) best = col;
+            }
+        }
+        if (end == pattern.len) break;
+        start = end + 1;
+    }
+    return best;
 }
