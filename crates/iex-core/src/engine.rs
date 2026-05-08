@@ -688,6 +688,16 @@ fn discover_files_parallel(
     options: PreparedSearchOptions,
     roots: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
+    if can_use_direct_discovery(options, roots) {
+        if let Some(files) = discover_files_direct(options, roots)? {
+            return Ok(files);
+        }
+    }
+
+    if cfg!(windows) {
+        return discover_files_serial(options, roots);
+    }
+
     let builder = build_walk_builder(options, roots);
     let (sender, receiver) = channel::unbounded::<PathBuf>();
     let walker = builder.build_parallel();
@@ -705,6 +715,92 @@ fn discover_files_parallel(
     drop(sender);
     let files: Vec<PathBuf> = receiver.into_iter().collect();
 
+    Ok(files)
+}
+
+fn can_use_direct_discovery(options: PreparedSearchOptions, roots: &[PathBuf]) -> bool {
+    !options.follow_symlinks
+        && roots
+            .iter()
+            .all(|root| !has_ignore_control_in_ancestors(root) && !has_ignore_control_marker(root))
+}
+
+fn has_ignore_control_marker(root: &Path) -> bool {
+    root.join(".git").exists() || root.join(".gitignore").exists() || root.join(".ignore").exists()
+}
+
+fn has_ignore_control_in_ancestors(root: &Path) -> bool {
+    root.ancestors().skip(1).any(has_ignore_control_marker)
+}
+
+fn discover_files_direct(
+    options: PreparedSearchOptions,
+    roots: &[PathBuf],
+) -> Result<Option<Vec<PathBuf>>> {
+    let mut files = Vec::new();
+    for root in roots {
+        if !discover_files_direct_root(root, options, &mut files)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(files))
+}
+
+fn discover_files_direct_root(
+    root: &Path,
+    options: PreparedSearchOptions,
+    files: &mut Vec<PathBuf>,
+) -> Result<bool> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(true),
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name();
+        if is_ignore_control_file_name(&name) {
+            return Ok(false);
+        }
+        if !options.include_hidden && is_hidden_file_name(&name) {
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_file() {
+            files.push(path);
+        } else if file_type.is_dir() {
+            if !discover_files_direct_root(&path, options, files)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn is_hidden_file_name(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with('.')
+}
+
+fn is_ignore_control_file_name(name: &std::ffi::OsStr) -> bool {
+    matches!(name.to_str(), Some(".git" | ".gitignore" | ".ignore"))
+}
+
+fn discover_files_serial(
+    options: PreparedSearchOptions,
+    roots: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let builder = build_walk_builder(options, roots);
+    let mut files = Vec::new();
+    for result in builder.build() {
+        if let Ok(entry) = result {
+            if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                files.push(entry.into_path());
+            }
+        }
+    }
     Ok(files)
 }
 
@@ -2426,10 +2522,10 @@ mod tests {
 
     use super::{
         auto_threads_for_shape, auto_threads_for_shape_with_available,
-        auto_threads_for_streaming_with_available, discover_files, dominant_parallel_thread_cap,
-        is_linux_dominant_file_target, linux_dominant_file_gate,
-        linux_dominant_file_parallel_plan_with_available, linux_strategy_prefers_streaming,
-        linux_strategy_selector_eligible, linux_strategy_stats,
+        auto_threads_for_streaming_with_available, can_use_direct_discovery, discover_files,
+        discover_files_direct, dominant_parallel_thread_cap, is_linux_dominant_file_target,
+        linux_dominant_file_gate, linux_dominant_file_parallel_plan_with_available,
+        linux_strategy_prefers_streaming, linux_strategy_selector_eligible, linux_strategy_stats,
         parallel_fast_count_min_chunk_bytes, parallel_fast_count_plan_with_available,
         partition_roots, prefer_single_root_streaming_stats_only, prepare_search_targets,
         run_search, run_search_prepared, scan_loaded_bytes, should_stream_stats_only,
@@ -2471,6 +2567,61 @@ mod tests {
             assert!(resolved >= 1);
             assert!(resolved <= available.max(1));
         }
+    }
+
+    #[test]
+    fn direct_discovery_requires_ignore_neutral_roots_and_preserves_hidden_filtering() {
+        let root = unique_temp_path("iex-engine-direct-discovery");
+        let nested = root.join("nested");
+        let hidden_dir = root.join(".shadow");
+        fs::create_dir_all(&nested).expect("nested dir should be created");
+        fs::create_dir_all(&hidden_dir).expect("hidden dir should be created");
+        fs::write(root.join("alpha.txt"), "needle\n").expect("alpha should write");
+        fs::write(nested.join("beta.txt"), "needle\n").expect("beta should write");
+        fs::write(hidden_dir.join("secret.txt"), "needle\n").expect("secret should write");
+
+        let options = PreparedSearchOptions {
+            include_hidden: false,
+            follow_symlinks: false,
+        };
+        assert!(can_use_direct_discovery(options, &[root.clone()]));
+
+        let files = discover_files_direct(options, &[root.clone()])
+            .expect("direct discovery should scan ignore-neutral roots")
+            .expect("ignore-neutral direct discovery should not request fallback");
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|path| path.ends_with("alpha.txt")));
+        assert!(files.iter().any(|path| path.ends_with("beta.txt")));
+        assert!(!files.iter().any(|path| path.ends_with("secret.txt")));
+
+        fs::write(root.join(".gitignore"), "*.txt\n").expect("ignore marker should write");
+        assert!(!can_use_direct_discovery(options, &[root.clone()]));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_discovery_aborts_to_conservative_walker_on_nested_ignore_markers() {
+        let root = unique_temp_path("iex-engine-direct-discovery-nested-ignore");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("nested dir should be created");
+        fs::write(root.join("alpha.txt"), "needle\n").expect("alpha should write");
+        fs::write(nested.join(".ignore"), "*.txt\n").expect("nested ignore should write");
+        fs::write(nested.join("beta.txt"), "needle\n").expect("beta should write");
+
+        let options = PreparedSearchOptions {
+            include_hidden: false,
+            follow_symlinks: false,
+        };
+        assert!(can_use_direct_discovery(options, &[root.clone()]));
+        let files = discover_files_direct(options, &[root.clone()])
+            .expect("direct discovery should inspect nested ignore markers");
+        assert!(
+            files.is_none(),
+            "nested ignore markers must force conservative walker fallback"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
