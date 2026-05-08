@@ -1069,15 +1069,23 @@ fn asciiLowerBuf(dst: []u8, src: []const u8) void {
 /// Case-sensitive path uses sz.indexOf (StringZilla AVX2 memmem), which
 /// fingerprints by first+last byte across 32 positions per SIMD pass.
 ///
-/// Case-insensitive path uses SIMD casefold: both line and needle are
-/// lowercased into stack buffers via AVX2 vector ops (32 bytes/iter),
-/// then searched with sz.indexOf. This converts O(n×m) scalar
-/// comparison into O(n) casefold + O(n) SIMD search.
+/// Case-insensitive path dispatches to indexOfLiteralCasefold (separate
+/// function) to keep this hot path's stack frame under 4 KiB. On Windows,
+/// frames > 4 KiB trigger __chkstk page probes on every call — including
+/// case-sensitive calls that take the early return. Isolating the 32 KiB
+/// casefold buffer into its own function eliminates that overhead.
 fn indexOfLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) ?usize {
     if (!case_insensitive) return sz.indexOf(line, needle);
     if (needle.len == 0) return 0;
     if (needle.len > line.len) return null;
-    // SIMD casefold path: lowercase both into stack buffers, then AVX2 search.
+    return indexOfLiteralCasefold(line, needle);
+}
+
+/// SIMD casefold search — isolated from indexOfLiteral to quarantine the
+/// 32 KiB stack buffer away from the case-sensitive hot path.
+/// Lowercase both line and needle into stack buffers via AVX2 vector ops,
+/// then search with sz.indexOf. O(n) casefold + O(n) SIMD search.
+fn indexOfLiteralCasefold(line: []const u8, needle: []const u8) ?usize {
     if (line.len <= CASEFOLD_LINE_MAX and needle.len <= CASEFOLD_NEEDLE_MAX) {
         var lower_line: [CASEFOLD_LINE_MAX]u8 = undefined;
         var lower_needle: [CASEFOLD_NEEDLE_MAX]u8 = undefined;
@@ -1085,7 +1093,6 @@ fn indexOfLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) 
         asciiLowerBuf(lower_needle[0..needle.len], needle);
         return sz.indexOf(lower_line[0..line.len], lower_needle[0..needle.len]);
     }
-    // Scalar fallback for oversized inputs.
     return indexOfLiteralScalar(line, needle);
 }
 
@@ -1102,13 +1109,28 @@ fn indexOfLiteralScalar(line: []const u8, needle: []const u8) ?usize {
 }
 
 /// Counts non-overlapping occurrences of a literal needle in a line.
-/// Case-insensitive mode casefolds the line once into a stack buffer,
-/// then runs sz.indexOf in a loop on the lowered copy — avoiding
-/// redundant casefold work per match position.
+/// Case-sensitive path calls sz.indexOf directly in a tight loop.
+/// Case-insensitive path dispatches to countLiteralCasefold (separate
+/// function) to quarantine the 32 KiB casefold buffer.
 fn countLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) usize {
     if (needle.len == 0) return 0;
-    // Case-insensitive fast path: casefold once, then sz.indexOf loop.
-    if (case_insensitive and line.len <= CASEFOLD_LINE_MAX and needle.len <= CASEFOLD_NEEDLE_MAX) {
+    if (case_insensitive) return countLiteralCasefold(line, needle);
+    // Case-sensitive: sz.indexOf directly, no indirection.
+    var total: usize = 0;
+    var start: usize = 0;
+    while (start + needle.len <= line.len) {
+        const index = sz.indexOf(line[start..], needle) orelse break;
+        total += 1;
+        start += index + needle.len;
+    }
+    return total;
+}
+
+/// Casefold-once counting — isolated from countLiteral to quarantine the
+/// 32 KiB stack buffer. Lowercase the line once, then loop sz.indexOf
+/// on the lowered copy to avoid redundant casefold per match position.
+fn countLiteralCasefold(line: []const u8, needle: []const u8) usize {
+    if (line.len <= CASEFOLD_LINE_MAX and needle.len <= CASEFOLD_NEEDLE_MAX) {
         var lower_line: [CASEFOLD_LINE_MAX]u8 = undefined;
         var lower_needle: [CASEFOLD_NEEDLE_MAX]u8 = undefined;
         asciiLowerBuf(lower_line[0..line.len], line);
@@ -1124,11 +1146,11 @@ fn countLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) us
         }
         return total;
     }
-    // Case-sensitive or scalar fallback.
+    // Scalar fallback for oversized lines.
     var total: usize = 0;
     var start: usize = 0;
     while (start <= line.len) {
-        const index = indexOfLiteral(line[start..], needle, case_insensitive) orelse break;
+        const index = indexOfLiteralScalar(line[start..], needle) orelse break;
         total += 1;
         start += index + needle.len;
     }
