@@ -828,9 +828,19 @@ fn countRegexStatsOnly(line: []const u8, pattern: []const u8, case_insensitive: 
 
 fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool) usize {
     return switch (predicate.strategy) {
-        .regex_plain_literal => countRegexLiteral(line, predicate.value, case_insensitive),
+        .regex_plain_literal => blk: {
+            // Pure literals (no backslash escapes) use SIMD-backed countLiteral.
+            // Escaped patterns (e.g. `re:foo\.bar`) fall through to regex literal matcher.
+            if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null) {
+                break :blk countLiteral(line, predicate.value, case_insensitive);
+            }
+            break :blk countRegexLiteral(line, predicate.value, case_insensitive);
+        },
         .regex_ascii_casefold_literal => blk: {
             const body = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            if (std.mem.indexOfScalar(u8, body, '\\') == null) {
+                break :blk countLiteral(line, body, true);
+            }
             break :blk countRegexLiteral(line, body, true);
         },
         .regex_word_boundary_literal => if (wordBoundaryLiteralColumn(line, stripWordBoundaryAnchors(predicate.value), case_insensitive) != null) 1 else 0,
@@ -940,11 +950,18 @@ fn predicateColumn(line: []const u8, predicate: expr.Predicate, case_insensitive
 fn regexColumnByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool) ?usize {
     return switch (predicate.strategy) {
         .regex_plain_literal => {
+            // Pure literals (no backslash escapes) use SIMD-backed indexOfLiteral.
+            if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null) {
+                return if (indexOfLiteral(line, predicate.value, case_insensitive)) |index| index + 1 else null;
+            }
             const index = indexOfRegexLiteral(line, predicate.value, case_insensitive) orelse return null;
             return index + 1;
         },
         .regex_ascii_casefold_literal => {
             const body = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            if (std.mem.indexOfScalar(u8, body, '\\') == null) {
+                return if (indexOfLiteral(line, body, true)) |index| index + 1 else null;
+            }
             const index = indexOfRegexLiteral(line, body, true) orelse return null;
             return index + 1;
         },
