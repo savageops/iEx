@@ -1081,12 +1081,18 @@ fn isHiddenPath(path: []const u8) bool {
 // This converts O(n×m) scalar comparison into O(n) casefold + O(n) SIMD
 // search — a ~10-30x speedup on typical source code lines.
 
-/// Stack buffer ceiling for SIMD casefold. 32 KiB covers virtually all
-/// source code lines; longer lines fall back to the scalar path.
-const CASEFOLD_LINE_MAX = 32 * 1024;
+/// Stack buffer ceiling for SIMD casefold. 2 KiB keeps the combined
+/// casefold stack frame (line_buf + needle_buf + overhead) under 4 KiB,
+/// which is the Windows __chkstk threshold. Frames ≥ 4 KiB require a
+/// __chkstk page-probe call on every function entry — with 100k lines
+/// this adds ~1ms on case-insensitive searches. Lines longer than 2 KiB
+/// are virtually absent in real source code and fall back to the scalar path.
+const CASEFOLD_LINE_MAX = 2 * 1024;
 
-/// Maximum needle length for stack-buffered casefold.
-const CASEFOLD_NEEDLE_MAX = 1024;
+/// Maximum needle length for stack-buffered casefold. 256 B is sufficient
+/// for any realistic search pattern; combined with CASEFOLD_LINE_MAX the
+/// total stack frame stays under 4 KiB.
+const CASEFOLD_NEEDLE_MAX = 256;
 
 /// SIMD-accelerated ASCII lowercase. Processes 32 bytes per iteration
 /// using AVX2 vector operations, with a scalar tail for the remainder.
