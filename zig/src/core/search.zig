@@ -107,7 +107,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
 
     // Phase 1: Discover all files via serial directory walk.
     const discover_started = std.Io.Timestamp.now(io, .awake);
-    var file_list = FileList.empty;
+    var file_list = try FileList.initWithCapacity(allocator, 512);
     for (roots.items[0..roots.count]) |root| {
         try discoverFiles(io, allocator, root.original, request, &file_list, &report);
     }
@@ -143,20 +143,22 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
 ///
 /// ADAPTIVE SCALING RATIONALE:
 /// On Windows, spawning one OS thread (CreateThread) costs ~210μs. For small
-/// corpora, spawning 15 workers to scan 100 files means spawn_cost (3.15ms)
-/// dwarfs actual scan work (~0.3ms), giving 3.5ms wall instead of a possible 1ms.
+/// corpora, over-threading means spawn_cost dwarfs actual scan work.
 ///
 /// Optimal thread count N minimises: spawn_cost*N + total_work/N
 /// Setting d/dN = 0: N* = sqrt(total_work / spawn_cost)
-/// Empirically: work_per_file ≈ 60μs, spawn_cost ≈ 210μs → N* ≈ sqrt(files/3.5)
-/// We use the integer ceil of sqrt(files/3) as a safe approximation.
+/// With whole-buffer fast count: work_per_file ≈ 26μs, spawn_cost ≈ 210μs
+/// → N* ≈ sqrt(files/8). We use ceil(sqrt(files/8)) as the adaptive target.
+///
+///   100 files → 4 threads    (was 6 with /3, benchmark-optimal)
+///   500 files → 8 threads    (was 13 with /3, reduced spawn overhead)
 fn effectiveThreadCount(request: cli.SearchRequest, file_count: usize) usize {
     if (request.threads) |threads| return @max(threads, 1);
     const cpus = availableThreads();
     const hard_cap: usize = @min(cpus, 16);
-    // ceil(sqrt(file_count / 3)): loop finds smallest n where n² * 3 >= file_count.
+    // ceil(sqrt(file_count / 8)): loop finds smallest n where n² * 8 >= file_count.
     var adaptive: usize = 1;
-    while (adaptive * adaptive * 3 < file_count) : (adaptive += 1) {}
+    while (adaptive * adaptive * 8 < file_count) : (adaptive += 1) {}
     return @min(hard_cap, adaptive);
 }
 
@@ -173,6 +175,11 @@ const FileList = struct {
     capacity: usize,
 
     const empty: FileList = .{ .buffer = null, .len = 0, .capacity = 0 };
+
+    fn initWithCapacity(allocator: std.mem.Allocator, cap: usize) !FileList {
+        const buf = try allocator.alloc(DiscoveredFile, cap);
+        return .{ .buffer = buf.ptr, .len = 0, .capacity = cap };
+    }
 
     fn append(self: *FileList, allocator: std.mem.Allocator, entry: DiscoveredFile) !void {
         if (self.len == self.capacity) {
@@ -236,12 +243,13 @@ fn discoverDirectory(
             report.files_skipped += 1;
             continue;
         }
-        const child_path = try std.fs.path.join(allocator, &[_][]const u8{ path, entry.name });
+        // Build child path with forward slashes directly — one allocation
+        // instead of path.join (alloc #1) + normalizeDisplayPath (alloc #2).
+        const child_path = try joinPathForward(allocator, path, entry.name);
         switch (entry.kind) {
             .file => {
                 report.files_discovered += 1;
-                const display_path = try normalizeDisplayPath(allocator, child_path);
-                try file_list.append(allocator, .{ .path = display_path });
+                try file_list.append(allocator, .{ .path = child_path });
             },
             .directory => try discoverDirectory(io, allocator, child_path, request, file_list, report),
             else => {},
@@ -335,11 +343,22 @@ fn scanOpenFileIntoShard(
     shard: *ShardReport,
 ) anyerror!void {
     const file_started = std.Io.Timestamp.now(io, .awake);
-    const file_len = try file.length(io);
-    const file_bytes: usize = @intCast(file_len);
 
-    // Empty files are text by definition — record as a single empty line.
-    if (file_len == 0) {
+    // CHUNK CASEFOLD: when stats-only and the plan is a single all-lowercase
+    // casefold-literal predicate, lowercase the read buffer in-place once per
+    // chunk instead of casefolding every line individually.
+    const chunk_casefold = request.stats_only and planIsFullyCasefoldLiteral(plan);
+
+    var read_buffer: [1024 * 1024]u8 = undefined;
+
+    // Read first chunk — doubles as binary sniff and file-size inference.
+    // Uses single-shot readPositional (not readPositionalAll) to avoid a
+    // retry syscall when the file is smaller than the 1 MiB buffer.
+    // Combined with skipping file.length(), this eliminates two syscalls
+    // per file for the common case (files < 1 MiB).
+    const first_read = try file.readPositional(io, &.{&read_buffer}, 0);
+    if (first_read == 0) {
+        // Empty file — record as a single empty line.
         shard.files_scanned += 1;
         recordLineIntoShard(allocator, display_path, "", 1, request, plan, shard, false);
         const file_ms = elapsedMs(io, file_started);
@@ -347,25 +366,17 @@ fn scanOpenFileIntoShard(
         if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
         return;
     }
-
-    // CHUNK CASEFOLD: when stats-only and the plan is a single all-lowercase
-    // casefold-literal predicate, lowercase the read buffer in-place once per
-    // chunk instead of casefolding every line individually.  Reduces ~100k
-    // per-line function calls to ~500 per-file AVX2 passes for large-dir.
-    // Only safe in stats-only mode — hit-collecting needs the original bytes
-    // for preview display.
-    const chunk_casefold = request.stats_only and planIsFullyCasefoldLiteral(plan);
-
-    var read_buffer: [1024 * 1024]u8 = undefined;
-
-    // Read first chunk — doubles as binary sniff. Loop-peeled so there is no
-    // `if (offset == 0)` branch in the hot scan path.
-    const first_target: usize = @intCast(@min(read_buffer.len, file_len));
-    const first_read = try file.readPositionalAll(io, read_buffer[0..first_target], 0);
-    if (first_read == 0 or sz.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
+    if (sz.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
         shard.files_skipped += 1;
         return;
     }
+
+    // Determine file size: if the first read didn't fill the buffer, the
+    // whole file fits in one chunk and first_read IS the file size.
+    // Otherwise, query the actual length for multi-chunk handling.
+    const single_chunk = first_read < read_buffer.len;
+    const file_bytes: usize = if (single_chunk) first_read else @intCast(try file.length(io));
+
     shard.files_scanned += 1;
     shard.bytes_scanned += file_bytes;
     if (file_bytes >= shard.slowest_bytes) {
@@ -375,6 +386,22 @@ fn scanOpenFileIntoShard(
 
     // Casefold the first chunk in-place after binary sniff confirms it is text.
     if (chunk_casefold) asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
+
+    // WHOLE-BUFFER FAST COUNT: for single-chunk files in stats-only mode,
+    // count occurrences across the entire buffer without line splitting.
+    // This mirrors Rust's fast_match_count_no_hits_bytes path which does
+    // finder.find_iter(haystack).count() on the mmap'd buffer — a single
+    // SIMD pass with zero per-line overhead.
+    if (request.stats_only and single_chunk) {
+        const ci = if (chunk_casefold) false else request.case_insensitive;
+        if (wholeBufferFastCount(read_buffer[0..first_read], plan, ci, chunk_casefold)) |count| {
+            shard.matches_found += count;
+            const file_ms = elapsedMs(io, file_started);
+            shard.scan_work_ms_total += file_ms;
+            if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            return;
+        }
+    }
 
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
@@ -405,9 +432,9 @@ fn scanOpenFileIntoShard(
                 break;
             }
         }
-        if (shard.truncated or offset >= file_len) break;
+        if (shard.truncated or offset >= file_bytes) break;
         // Read next chunk — only for files > 1 MiB.
-        const remaining = file_len - offset;
+        const remaining: u64 = @as(u64, @intCast(file_bytes)) - offset;
         const target_len: usize = @intCast(@min(read_buffer.len, remaining));
         const read_len = try file.readPositionalAll(io, read_buffer[0..target_len], offset);
         if (read_len == 0) break;
@@ -461,18 +488,26 @@ fn recordLineIntoShard(
     }
 }
 
-/// Worker thread entry point. Scans its assigned shard of files.
-fn shardWorker(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, shard: *ShardReport) void {
-    for (files) |entry| {
-        if (shard.truncated) break;
-        scanFileIntoShard(io, allocator, entry.path, request, plan, shard);
+/// Work-stealing shard worker: each thread atomically claims the next file
+/// index from a shared counter.  This replaces static partitioning with
+/// dynamic load balancing — threads that finish fast files immediately grab
+/// more work instead of idling while a slow shard drains.  Mirrors the
+/// work-stealing semantics of Rust's rayon::par_iter.
+///
+/// The atomic fetchAdd compiles to a single `lock xadd` (~10 cycles).
+/// With 500 files that's ~5000 cycles ≈ 1.25μs — negligible vs per-file I/O.
+fn shardWorker(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, shard: *ShardReport) void {
+    while (!shard.truncated) {
+        const idx = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
+        if (idx >= files.len) break;
+        scanFileIntoShard(io, allocator, files[idx].path, request, plan, shard);
     }
 }
 
-/// Phase 2: Distribute files across N threads and scan in parallel.
-/// Each thread gets a contiguous slice of the file list (static partitioning)
-/// and writes into its own ShardReport. After all threads join, shard results
-/// are merged into the main report.
+/// Phase 2: Distribute files across N threads using atomic work-stealing.
+/// Each thread atomically claims files from a shared counter and writes into
+/// its own ShardReport.  After all threads join, shard results are merged
+/// into the main report.
 fn parallelScanFiles(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -490,29 +525,18 @@ fn parallelScanFiles(
     const shards = try allocator.alloc(ShardReport, actual_threads);
     for (shards) |*s| s.* = ShardReport.empty;
 
-    // Partition files across shards using round-robin-ish static split.
-    const base_size = files.len / actual_threads;
-    const remainder = files.len % actual_threads;
-
-    // Calculate shard boundaries.
-    const boundaries = try allocator.alloc(usize, actual_threads + 1);
-    boundaries[0] = 0;
-    for (0..actual_threads) |i| {
-        const extra: usize = if (i < remainder) 1 else 0;
-        boundaries[i + 1] = boundaries[i] + base_size + extra;
-    }
+    // Shared atomic counter — each thread claims the next file by incrementing.
+    var next_file: usize = 0;
 
     // Spawn worker threads (shards 1..N-1).
     const threads = try allocator.alloc(std.Thread, worker_count);
     for (0..worker_count) |i| {
         const shard_index = i + 1;
-        const shard_files = files[boundaries[shard_index]..boundaries[shard_index + 1]];
-        threads[i] = try std.Thread.spawn(.{}, shardWorker, .{ io, allocator, shard_files, request, plan, &shards[shard_index] });
+        threads[i] = try std.Thread.spawn(.{}, shardWorker, .{ io, allocator, &next_file, files, request, plan, &shards[shard_index] });
     }
 
-    // Main thread processes shard 0.
-    const main_files = files[boundaries[0]..boundaries[1]];
-    shardWorker(io, allocator, main_files, request, plan, &shards[0]);
+    // Main thread processes shard 0 using the same work-stealing loop.
+    shardWorker(io, allocator, &next_file, files, request, plan, &shards[0]);
 
     // Join all worker threads.
     for (threads) |t| t.join();
@@ -737,11 +761,17 @@ fn scanOpenFile(
     report: *SearchReport,
 ) anyerror!void {
     const file_started = std.Io.Timestamp.now(io, .awake);
-    const file_len = try file.length(io);
-    const file_bytes: usize = @intCast(file_len);
 
-    // Empty files are text by definition — record as a single empty line.
-    if (file_len == 0) {
+    const chunk_casefold = request.stats_only and planIsFullyCasefoldLiteral(plan);
+
+    var read_buffer: [1024 * 1024]u8 = undefined;
+
+    // Read first chunk — doubles as binary sniff and file-size inference.
+    // Uses single-shot readPositional (not readPositionalAll) to avoid a
+    // retry syscall when the file is smaller than the 1 MiB buffer.
+    const first_read = try file.readPositional(io, &.{&read_buffer}, 0);
+    if (first_read == 0) {
+        // Empty file — record as a single empty line.
         report.files_scanned += 1;
         try recordLine(allocator, display_path, "", 1, request, plan, report, false);
         const file_ms = elapsedMs(io, file_started);
@@ -749,17 +779,14 @@ fn scanOpenFile(
         if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
         return;
     }
-
-    var read_buffer: [1024 * 1024]u8 = undefined;
-
-    // Read first chunk — doubles as binary sniff. Loop-peeled so there is no
-    // `if (offset == 0)` branch in the hot scan path.
-    const first_target: usize = @intCast(@min(read_buffer.len, file_len));
-    const first_read = try file.readPositionalAll(io, read_buffer[0..first_target], 0);
-    if (first_read == 0 or sz.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
+    if (sz.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
         report.files_skipped += 1;
         return;
     }
+
+    const single_chunk = first_read < read_buffer.len;
+    const file_bytes: usize = if (single_chunk) first_read else @intCast(try file.length(io));
+
     report.files_scanned += 1;
     report.bytes_scanned += file_bytes;
     if (file_bytes >= report.slowest_bytes) {
@@ -767,16 +794,20 @@ fn scanOpenFile(
         report.slowest_bytes = file_bytes;
     }
 
-    // CHUNK CASEFOLD: when stats-only and the plan is a single all-lowercase
-    // casefold-literal predicate, lowercase the read buffer in-place once per
-    // chunk instead of casefolding every line individually.  Reduces ~100k
-    // per-line function calls to ~500 per-file AVX2 passes for large-dir.
-    // Only safe in stats-only mode — hit-collecting needs the original bytes
-    // for preview display.
-    const chunk_casefold = request.stats_only and planIsFullyCasefoldLiteral(plan);
-
     // Casefold the first chunk in-place after binary sniff confirms it is text.
     if (chunk_casefold) asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
+
+    // WHOLE-BUFFER FAST COUNT (serial path): same optimization as parallel path.
+    if (request.stats_only and single_chunk) {
+        const ci = if (chunk_casefold) false else request.case_insensitive;
+        if (wholeBufferFastCount(read_buffer[0..first_read], plan, ci, chunk_casefold)) |count| {
+            report.matches_found += count;
+            const file_ms = elapsedMs(io, file_started);
+            report.scan_work_ms_total += file_ms;
+            if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
+            return;
+        }
+    }
 
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
@@ -808,9 +839,9 @@ fn scanOpenFile(
                 break;
             }
         }
-        if (report.truncated or offset >= file_len) break;
+        if (report.truncated or offset >= file_bytes) break;
         // Read next chunk — only for files > 1 MiB.
-        const remaining = file_len - offset;
+        const remaining: u64 = @as(u64, @intCast(file_bytes)) - offset;
         const target_len: usize = @intCast(@min(read_buffer.len, remaining));
         const read_len = try file.readPositionalAll(io, read_buffer[0..target_len], offset);
         if (read_len == 0) break;
@@ -875,6 +906,53 @@ fn planIsFullyCasefoldLiteral(plan: expr.ExpressionPlan) bool {
     const body = if (std.mem.startsWith(u8, pred.value, "(?i)")) pred.value[4..] else pred.value;
     for (body) |c| if (c >= 'A' and c <= 'Z') return false;
     return true;
+}
+
+/// WHOLE-BUFFER FAST COUNT: for stats-only single-predicate searches, count
+/// literal/regex-literal occurrences in the entire file buffer instead of
+/// splitting into lines.  A literal needle contains no newline bytes, so every
+/// buffer-level occurrence is guaranteed to lie within a single line — the
+/// count is identical to the sum of per-line counts.
+///
+/// This eliminates ~200 SIMD newline scans + ~200 recordLineIntoShard calls
+/// per file (100k total for a 500-file corpus).  Mirrors Rust's
+/// `fast_match_count_no_hits_bytes` which does `finder.find_iter(haystack).count()`.
+///
+/// Returns null for predicates that require line context (prefix, suffix,
+/// word boundary) or multi-predicate plans — caller falls through to the
+/// line-by-line path.
+fn wholeBufferFastCount(buffer: []const u8, plan: expr.ExpressionPlan, case_insensitive: bool, chunk_casefolded: bool) ?usize {
+    if (plan.predicate_count != 1) return null;
+    const pred = plan.predicates[0];
+    return switch (pred.kind) {
+        .literal => countLiteral(buffer, pred.value, case_insensitive),
+        .regex => wholeBufferRegexCount(buffer, pred, case_insensitive, chunk_casefolded),
+        .prefix, .suffix => null, // line-context-dependent
+    };
+}
+
+/// Whole-buffer counting for regex predicates.  Only eligible strategies are
+/// dispatched — word boundary and full-regex fall through to null so the
+/// caller uses the line-by-line path.
+fn wholeBufferRegexCount(buffer: []const u8, predicate: expr.Predicate, case_insensitive: bool, chunk_casefolded: bool) ?usize {
+    return switch (predicate.strategy) {
+        .regex_plain_literal => blk: {
+            if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null) {
+                break :blk countLiteral(buffer, predicate.value, case_insensitive);
+            }
+            break :blk countRegexLiteral(buffer, predicate.value, case_insensitive);
+        },
+        .regex_ascii_casefold_literal => blk: {
+            const body = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            const effective_ci = if (chunk_casefolded) false else true;
+            if (std.mem.indexOfScalar(u8, body, '\\') == null) {
+                break :blk countLiteral(buffer, body, effective_ci);
+            }
+            break :blk countRegexLiteral(buffer, body, effective_ci);
+        },
+        // Alternates, word boundary, full regex → per-line semantics required
+        else => null,
+    };
 }
 
 /// Stats-only mode counts matches without retaining hit records.
@@ -967,6 +1045,18 @@ fn normalizeDisplayPath(allocator: std.mem.Allocator, path: []const u8) ![]const
         if (byte.* == '\\') byte.* = '/';
     }
     return normalized;
+}
+
+/// Join parent + child with a forward slash separator in a single allocation.
+/// Replaces the two-allocation pattern of std.fs.path.join (which uses
+/// OS-native backslash on Windows) followed by normalizeDisplayPath.
+/// The result is already display-normalized and owned by `allocator`.
+fn joinPathForward(allocator: std.mem.Allocator, parent: []const u8, child: []const u8) ![]const u8 {
+    const buf = try allocator.alloc(u8, parent.len + 1 + child.len);
+    @memcpy(buf[0..parent.len], parent);
+    buf[parent.len] = '/';
+    @memcpy(buf[parent.len + 1 ..][0..child.len], child);
+    return buf;
 }
 
 pub fn matchesLine(line: []const u8, plan: expr.ExpressionPlan) bool {
