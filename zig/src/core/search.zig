@@ -341,12 +341,20 @@ fn scanOpenFileIntoShard(
     // Empty files are text by definition — record as a single empty line.
     if (file_len == 0) {
         shard.files_scanned += 1;
-        recordLineIntoShard(allocator, display_path, "", 1, request, plan, shard);
+        recordLineIntoShard(allocator, display_path, "", 1, request, plan, shard, false);
         const file_ms = elapsedMs(io, file_started);
         shard.scan_work_ms_total += file_ms;
         if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
         return;
     }
+
+    // CHUNK CASEFOLD: when stats-only and the plan is a single all-lowercase
+    // casefold-literal predicate, lowercase the read buffer in-place once per
+    // chunk instead of casefolding every line individually.  Reduces ~100k
+    // per-line function calls to ~500 per-file AVX2 passes for large-dir.
+    // Only safe in stats-only mode — hit-collecting needs the original bytes
+    // for preview display.
+    const chunk_casefold = request.stats_only and planIsFullyCasefoldLiteral(plan);
 
     var read_buffer: [1024 * 1024]u8 = undefined;
 
@@ -365,6 +373,9 @@ fn scanOpenFileIntoShard(
         shard.slowest_bytes = file_bytes;
     }
 
+    // Casefold the first chunk in-place after binary sniff confirms it is text.
+    if (chunk_casefold) asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
+
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
     var line_number: usize = 1;
@@ -380,10 +391,10 @@ fn scanOpenFileIntoShard(
             if (sz.indexOfByte(chunk[chunk_index..], '\n')) |relative_newline| {
                 const line_part = chunk[chunk_index .. chunk_index + relative_newline];
                 if (carry.items.len == 0) {
-                    recordLineIntoShard(allocator, display_path, line_part, line_number, request, plan, shard);
+                    recordLineIntoShard(allocator, display_path, line_part, line_number, request, plan, shard, chunk_casefold);
                 } else {
                     try carry.appendSlice(allocator, line_part);
-                    recordLineIntoShard(allocator, display_path, carry.items, line_number, request, plan, shard);
+                    recordLineIntoShard(allocator, display_path, carry.items, line_number, request, plan, shard, chunk_casefold);
                     carry.clearRetainingCapacity();
                 }
                 if (shard.truncated) break;
@@ -402,10 +413,12 @@ fn scanOpenFileIntoShard(
         if (read_len == 0) break;
         offset += read_len;
         chunk = read_buffer[0..read_len];
+        // Casefold each subsequent chunk in-place for the same amortised benefit.
+        if (chunk_casefold) asciiLowerBuf(read_buffer[0..read_len], read_buffer[0..read_len]);
     }
 
     if (!shard.truncated and (carry.items.len > 0 or ended_with_newline)) {
-        recordLineIntoShard(allocator, display_path, carry.items, line_number, request, plan, shard);
+        recordLineIntoShard(allocator, display_path, carry.items, line_number, request, plan, shard, chunk_casefold);
     }
     const file_ms = elapsedMs(io, file_started);
     shard.scan_work_ms_total += file_ms;
@@ -420,13 +433,19 @@ fn recordLineIntoShard(
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     shard: *ShardReport,
+    /// True when the chunk buffer was lowercased in-place before line splitting.
+    /// Only ever true in stats_only mode (no preview bytes needed).
+    chunk_casefolded: bool,
 ) void {
     const line = std.mem.trimEnd(u8, raw_line, "\r");
     if (request.stats_only) {
-        const count = statsOnlyMatchCount(line, plan, request.case_insensitive);
+        // When pre-lowercased pass case_insensitive=false — matching is already done.
+        const ci = if (chunk_casefolded) false else request.case_insensitive;
+        const count = statsOnlyMatchCount(line, plan, ci, chunk_casefolded);
         shard.matches_found += count;
         return;
     }
+    // chunk_casefolded is never true in hit-collecting mode (original bytes needed for preview).
     if (matchingColumn(line, plan, request.case_insensitive)) |column| {
         shard.matches_found += 1;
         const under_request_limit = if (request.max_hits) |max_hits| shard.hit_count < max_hits else true;
@@ -724,7 +743,7 @@ fn scanOpenFile(
     // Empty files are text by definition — record as a single empty line.
     if (file_len == 0) {
         report.files_scanned += 1;
-        try recordLine(allocator, display_path, "", 1, request, plan, report);
+        try recordLine(allocator, display_path, "", 1, request, plan, report, false);
         const file_ms = elapsedMs(io, file_started);
         report.scan_work_ms_total += file_ms;
         if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
@@ -748,6 +767,17 @@ fn scanOpenFile(
         report.slowest_bytes = file_bytes;
     }
 
+    // CHUNK CASEFOLD: when stats-only and the plan is a single all-lowercase
+    // casefold-literal predicate, lowercase the read buffer in-place once per
+    // chunk instead of casefolding every line individually.  Reduces ~100k
+    // per-line function calls to ~500 per-file AVX2 passes for large-dir.
+    // Only safe in stats-only mode — hit-collecting needs the original bytes
+    // for preview display.
+    const chunk_casefold = request.stats_only and planIsFullyCasefoldLiteral(plan);
+
+    // Casefold the first chunk in-place after binary sniff confirms it is text.
+    if (chunk_casefold) asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
+
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
     var line_number: usize = 1;
@@ -764,10 +794,10 @@ fn scanOpenFile(
             if (sz.indexOfByte(chunk[chunk_index..], '\n')) |relative_newline| {
                 const line_part = chunk[chunk_index .. chunk_index + relative_newline];
                 if (carry.items.len == 0) {
-                    try recordLine(allocator, display_path, line_part, line_number, request, plan, report);
+                    try recordLine(allocator, display_path, line_part, line_number, request, plan, report, chunk_casefold);
                 } else {
                     try carry.appendSlice(allocator, line_part);
-                    try recordLine(allocator, display_path, carry.items, line_number, request, plan, report);
+                    try recordLine(allocator, display_path, carry.items, line_number, request, plan, report, chunk_casefold);
                     carry.clearRetainingCapacity();
                 }
                 if (report.truncated) break;
@@ -786,10 +816,12 @@ fn scanOpenFile(
         if (read_len == 0) break;
         offset += read_len;
         chunk = read_buffer[0..read_len];
+        // Casefold each subsequent chunk in-place for the same amortised benefit.
+        if (chunk_casefold) asciiLowerBuf(read_buffer[0..read_len], read_buffer[0..read_len]);
     }
 
     if (!report.truncated and (carry.items.len > 0 or ended_with_newline)) {
-        try recordLine(allocator, display_path, carry.items, line_number, request, plan, report);
+        try recordLine(allocator, display_path, carry.items, line_number, request, plan, report, chunk_casefold);
     }
     const file_ms = elapsedMs(io, file_started);
     report.scan_work_ms_total += file_ms;
@@ -804,10 +836,12 @@ fn recordLine(
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     report: *SearchReport,
+    chunk_casefolded: bool,
 ) !void {
     const line = std.mem.trimEnd(u8, raw_line, "\r");
     if (request.stats_only) {
-        const count = statsOnlyMatchCount(line, plan, request.case_insensitive);
+        const ci = if (chunk_casefolded) false else request.case_insensitive;
+        const count = statsOnlyMatchCount(line, plan, ci, chunk_casefolded);
         report.matches_found += count;
         return;
     }
@@ -826,23 +860,43 @@ fn recordLine(
     }
 }
 
+/// Returns true when the plan has exactly one predicate that is a
+/// case-insensitive ASCII literal (strategy regex_ascii_casefold_literal)
+/// whose body is already all-lowercase.  When true the scan engine may
+/// casefold the chunk buffer in-place once per file rather than casefolding
+/// every line individually, saving ~100k function calls on a 500-file corpus.
+/// Restricted to single-predicate plans so the multi-predicate matchingColumn
+/// path does not need a chunk_casefolded parameter.
+fn planIsFullyCasefoldLiteral(plan: expr.ExpressionPlan) bool {
+    if (plan.predicate_count != 1) return false;
+    const pred = plan.predicates[0];
+    if (pred.kind != .regex) return false;
+    if (pred.strategy != .regex_ascii_casefold_literal) return false;
+    const body = if (std.mem.startsWith(u8, pred.value, "(?i)")) pred.value[4..] else pred.value;
+    for (body) |c| if (c >= 'A' and c <= 'Z') return false;
+    return true;
+}
+
 /// Stats-only mode counts matches without retaining hit records.
 /// For single-predicate plans, it counts occurrences (a line with 3 matches
 /// reports 3, not 1). For multi-predicate plans, it falls back to boolean
 /// match — the line either matches all/any predicates or it doesn't.
 /// This distinction matters for Rust parity: `ix search --stats-only "lit:ERROR"`
 /// must report the same occurrence count as the Rust binary.
-fn statsOnlyMatchCount(line: []const u8, plan: expr.ExpressionPlan, case_insensitive: bool) usize {
+///
+/// chunk_casefolded: the line bytes were already lowercased in the chunk
+/// buffer — skip per-line casefold and use case-sensitive matching directly.
+fn statsOnlyMatchCount(line: []const u8, plan: expr.ExpressionPlan, case_insensitive: bool, chunk_casefolded: bool) usize {
     if (plan.predicate_count == 1) {
-        return predicateMatchCount(line, plan.predicates[0], case_insensitive);
+        return predicateMatchCount(line, plan.predicates[0], case_insensitive, chunk_casefolded);
     }
     return if (matchingColumn(line, plan, case_insensitive) != null) 1 else 0;
 }
 
-fn predicateMatchCount(line: []const u8, predicate: expr.Predicate, case_insensitive: bool) usize {
+fn predicateMatchCount(line: []const u8, predicate: expr.Predicate, case_insensitive: bool, chunk_casefolded: bool) usize {
     return switch (predicate.kind) {
         .literal => countLiteral(line, predicate.value, case_insensitive),
-        .regex => predicateMatchCountByStrategy(line, predicate, case_insensitive),
+        .regex => predicateMatchCountByStrategy(line, predicate, case_insensitive, chunk_casefolded),
         .prefix, .suffix => if (predicateMatches(line, predicate, case_insensitive)) 1 else 0,
     };
 }
@@ -854,7 +908,11 @@ fn countRegexStatsOnly(line: []const u8, pattern: []const u8, case_insensitive: 
     return regex.count(line, pattern, case_insensitive);
 }
 
-fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool) usize {
+/// chunk_casefolded: the line bytes are already lowercased (chunk was
+/// casefolded in-place).  For casefold-literal strategies this means
+/// the body is guaranteed lowercase and the line is lowercase, so we
+/// can use case-sensitive matching (false) instead of per-line casefold.
+fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool, chunk_casefolded: bool) usize {
     return switch (predicate.strategy) {
         .regex_plain_literal => blk: {
             // Pure literals (no backslash escapes) use SIMD-backed countLiteral.
@@ -866,15 +924,19 @@ fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, ca
         },
         .regex_ascii_casefold_literal => blk: {
             const body = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            // When chunk_casefolded: line is pre-lowercased & body is verified lowercase
+            // (planIsFullyCasefoldLiteral guarantee) → case-sensitive search suffices.
+            const effective_ci = if (chunk_casefolded) false else true;
             if (std.mem.indexOfScalar(u8, body, '\\') == null) {
-                break :blk countLiteral(line, body, true);
+                break :blk countLiteral(line, body, effective_ci);
             }
-            break :blk countRegexLiteral(line, body, true);
+            break :blk countRegexLiteral(line, body, effective_ci);
         },
         .regex_word_boundary_literal => if (wordBoundaryLiteralColumn(line, stripWordBoundaryAnchors(predicate.value), case_insensitive) != null) 1 else 0,
         .regex_ascii_casefold_word_boundary_literal => blk: {
             const after_flag = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
-            break :blk if (wordBoundaryLiteralColumn(line, stripWordBoundaryAnchors(after_flag), true) != null) 1 else 0;
+            const effective_ci = if (chunk_casefolded) false else true;
+            break :blk if (wordBoundaryLiteralColumn(line, stripWordBoundaryAnchors(after_flag), effective_ci) != null) 1 else 0;
         },
         .regex_literal_alternates => if (literalAlternatesColumn(line, predicate.value, case_insensitive) != null) 1 else 0,
         else => countRegexWithPrefilter(line, predicate.value, case_insensitive),
