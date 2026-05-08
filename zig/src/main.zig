@@ -5,6 +5,10 @@ const expr = @import("core/expr.zig");
 const inspect = @import("core/inspect.zig");
 const search = @import("core/search.zig");
 
+test {
+    _ = @import("core/trigram.zig");
+}
+
 /// IX Zig binary entry point.
 ///
 /// PIPELINE OVERVIEW:

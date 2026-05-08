@@ -3,6 +3,7 @@ const cli = @import("../cli/args.zig");
 const expr = @import("expr.zig");
 const regex = @import("regex.zig");
 const core_stats = @import("stats.zig");
+const trigram = @import("trigram.zig");
 // SIMD-accelerated byte/substring search via StringZilla (see sz.zig).
 // Replaces std.mem.indexOf (~1 byte/cycle) with AVX2 search (~32 bytes/cycle)
 // on the three hottest paths: newline scanning, binary sniffing, and literal matching.
@@ -308,6 +309,17 @@ fn scanFileIntoShard(
     };
 }
 
+/// Returns true if the file is likely binary (contains a null byte in the
+/// first 1024 bytes). Binary files are skipped — they can't contain meaningful
+/// text matches and can be large, so early detection avoids full content reads.
+fn isLikelyBinary(io: std.Io, file: std.Io.File, file_len: u64) !bool {
+    if (file_len == 0) return false;
+    var sniff: [1024]u8 = undefined;
+    const sniff_len: usize = @intCast(@min(1024, file_len));
+    const read_len = try file.readPositionalAll(io, sniff[0..sniff_len], 0);
+    return sz.indexOfByte(sniff[0..read_len], 0) != null;
+}
+
 /// Core per-file scan for the parallel path. Identical logic to
 /// scanOpenFile but writes into a ShardReport instead of SearchReport.
 fn scanOpenFileIntoShard(
@@ -322,6 +334,17 @@ fn scanOpenFileIntoShard(
     const file_started = std.Io.Timestamp.now(io, .awake);
     const file_len = try file.length(io);
     const file_bytes: usize = @intCast(file_len);
+
+    // Empty files are text by definition — record as a single empty line.
+    if (file_len == 0) {
+        shard.files_scanned += 1;
+        recordLineIntoShard(allocator, display_path, "", 1, request, plan, shard);
+        const file_ms = elapsedMs(io, file_started);
+        shard.scan_work_ms_total += file_ms;
+        if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+        return;
+    }
+
     if (try isLikelyBinary(io, file, file_len)) {
         shard.files_skipped += 1;
         return;
@@ -371,7 +394,7 @@ fn scanOpenFileIntoShard(
         if (shard.truncated) break;
     }
 
-    if (!shard.truncated and (carry.items.len > 0 or file_len == 0 or ended_with_newline)) {
+    if (!shard.truncated and (carry.items.len > 0 or ended_with_newline)) {
         recordLineIntoShard(allocator, display_path, carry.items, line_number, request, plan, shard);
     }
     const file_ms = elapsedMs(io, file_started);
@@ -679,7 +702,7 @@ fn scanOpenFile(
     io: std.Io,
     allocator: std.mem.Allocator,
     file: std.Io.File,
-    path: []const u8,
+    display_path: []const u8,
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     report: *SearchReport,
@@ -687,9 +710,18 @@ fn scanOpenFile(
     const file_started = std.Io.Timestamp.now(io, .awake);
     const file_len = try file.length(io);
     const file_bytes: usize = @intCast(file_len);
-    const display_path = try normalizeDisplayPath(allocator, path);
+
+    // Empty files are text by definition — record as a single empty line.
+    if (file_len == 0) {
+        report.files_scanned += 1;
+        try recordLine(allocator, display_path, "", 1, request, plan, report);
+        const file_ms = elapsedMs(io, file_started);
+        report.scan_work_ms_total += file_ms;
+        if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
+        return;
+    }
+
     if (try isLikelyBinary(io, file, file_len)) {
-        report.files_discovered += 0;
         report.files_skipped += 1;
         return;
     }
@@ -743,29 +775,12 @@ fn scanOpenFile(
         if (report.truncated) break;
     }
 
-    if (!report.truncated and (carry.items.len > 0 or file_len == 0 or ended_with_newline)) {
+    if (!report.truncated and (carry.items.len > 0 or ended_with_newline)) {
         try recordLine(allocator, display_path, carry.items, line_number, request, plan, report);
     }
     const file_ms = elapsedMs(io, file_started);
     report.scan_work_ms_total += file_ms;
     if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
-}
-
-/// HOT PATH 2: Binary file detection.
-/// Reads the first 1024 bytes and checks for a null byte (0x00). Text files
-/// virtually never contain null bytes; binary files (images, compiled objects,
-/// archives) almost always do within the first kilobyte.
-///
-/// sz.indexOfByte scans the 1024-byte sniff buffer with AVX2 — a single
-/// VPCMPEQB + VPMOVMSKB pass covers all 1024 bytes in ~32 iterations
-/// vs 1024 iterations with scalar code. This matters because binary
-/// detection runs on *every* discovered file before the scan loop begins.
-fn isLikelyBinary(io: std.Io, file: std.Io.File, file_len: u64) !bool {
-    if (file_len == 0) return false;
-    var buffer: [1024]u8 = undefined;
-    const target_len: usize = @intCast(@min(buffer.len, file_len));
-    const read_len = try file.readPositionalAll(io, buffer[0..target_len], 0);
-    return sz.indexOfByte(buffer[0..read_len], 0) != null;
 }
 
 fn recordLine(
