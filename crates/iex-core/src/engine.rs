@@ -40,6 +40,8 @@ const REGEX_DECOMPOSITION_PARALLEL_MAX_SHARD_THREADS: usize = 2;
 const DOMINANT_FILE_PARALLEL_THRESHOLD: usize = 512 * 1024 * 1024;
 const DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX: usize = 12;
 const STREAMING_PATH_QUEUE_MULTIPLIER: usize = 4;
+const WINDOWS_SERIAL_DISCOVERY_MAX_SAMPLE_DIRS: usize = 256;
+const WINDOWS_SERIAL_DISCOVERY_MAX_SAMPLE_FILES: usize = 2_048;
 const LINUX_STRATEGY_MIN_ROOT_ENTRIES: usize = 32;
 const LINUX_STRATEGY_MIN_FILES: usize = 50_000;
 const LINUX_DOMINANT_FILE_TARGET_CLASS: &str = "linux_amd_asic_reg_giant_header";
@@ -694,7 +696,7 @@ fn discover_files_parallel(
         }
     }
 
-    if cfg!(windows) {
+    if cfg!(windows) && should_use_serial_discovery_fallback_on_windows(roots) {
         return discover_files_serial(options, roots);
     }
 
@@ -731,6 +733,72 @@ fn has_ignore_control_marker(root: &Path) -> bool {
 
 fn has_ignore_control_in_ancestors(root: &Path) -> bool {
     root.ancestors().skip(1).any(has_ignore_control_marker)
+}
+
+fn should_use_serial_discovery_fallback_on_windows(roots: &[PathBuf]) -> bool {
+    roots.iter().all(|root| {
+        let mut sample = DiscoveryShapeSample::default();
+        sample_discovery_shape(root, &mut sample);
+        sample.within_serial_budget()
+    })
+}
+
+#[derive(Default)]
+struct DiscoveryShapeSample {
+    dirs: usize,
+    files: usize,
+    over_budget: bool,
+}
+
+impl DiscoveryShapeSample {
+    fn within_serial_budget(&self) -> bool {
+        !self.over_budget
+            && self.dirs <= WINDOWS_SERIAL_DISCOVERY_MAX_SAMPLE_DIRS
+            && self.files <= WINDOWS_SERIAL_DISCOVERY_MAX_SAMPLE_FILES
+    }
+
+    fn account_dir(&mut self) {
+        self.dirs += 1;
+        self.check_budget();
+    }
+
+    fn account_file(&mut self) {
+        self.files += 1;
+        self.check_budget();
+    }
+
+    fn check_budget(&mut self) {
+        if self.dirs > WINDOWS_SERIAL_DISCOVERY_MAX_SAMPLE_DIRS
+            || self.files > WINDOWS_SERIAL_DISCOVERY_MAX_SAMPLE_FILES
+        {
+            self.over_budget = true;
+        }
+    }
+}
+
+fn sample_discovery_shape(root: &Path, sample: &mut DiscoveryShapeSample) {
+    if sample.over_budget {
+        return;
+    }
+    sample.account_dir();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if sample.over_budget {
+            return;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            sample_discovery_shape(&entry.path(), sample);
+        } else if file_type.is_file() {
+            sample.account_file();
+        }
+    }
 }
 
 fn discover_files_direct(
@@ -2528,12 +2596,14 @@ mod tests {
         linux_strategy_prefers_streaming, linux_strategy_selector_eligible, linux_strategy_stats,
         parallel_fast_count_min_chunk_bytes, parallel_fast_count_plan_with_available,
         partition_roots, prefer_single_root_streaming_stats_only, prepare_search_targets,
-        run_search, run_search_prepared, scan_loaded_bytes, should_stream_stats_only,
-        threads_90pct, ConcurrencyPlanner, LinuxStrategyInputs, PreparedSearchOptions,
+        run_search, run_search_prepared, sample_discovery_shape, scan_loaded_bytes,
+        should_stream_stats_only, should_use_serial_discovery_fallback_on_windows, threads_90pct,
+        ConcurrencyPlanner, DiscoveryShapeSample, LinuxStrategyInputs, PreparedSearchOptions,
         SearchConfig, DOMINANT_FILE_PARALLEL_THREAD_CAP_MAX, DOMINANT_FILE_PARALLEL_THRESHOLD,
         LINUX_DOMINANT_FILE_MIN_BYTES, LINUX_STRATEGY_MIN_FILES, LINUX_STRATEGY_MIN_ROOT_ENTRIES,
         PARALLEL_FAST_COUNT_FILE_THRESHOLD, PARALLEL_FAST_COUNT_MEDIUM_MIN_CHUNK_BYTES,
         PARALLEL_FAST_COUNT_OUTER_LITERAL_MEDIUM_THREAD_CAP,
+        WINDOWS_SERIAL_DISCOVERY_MAX_SAMPLE_DIRS,
     };
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
@@ -2622,6 +2692,41 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_serial_discovery_fallback_is_shape_gated() {
+        let small_root = unique_temp_path("iex-engine-discovery-small-shape");
+        let large_root = unique_temp_path("iex-engine-discovery-large-shape");
+        fs::create_dir_all(&small_root).expect("small root should be created");
+        fs::create_dir_all(&large_root).expect("large root should be created");
+
+        for index in 0..8 {
+            fs::write(small_root.join(format!("small-{index}.txt")), "needle\n")
+                .expect("small fixture should write");
+        }
+        for index in 0..=WINDOWS_SERIAL_DISCOVERY_MAX_SAMPLE_DIRS {
+            let dir = large_root.join(format!("dir-{index}"));
+            fs::create_dir_all(&dir).expect("large dir should be created");
+            fs::write(dir.join("needle.txt"), "needle\n").expect("large fixture should write");
+        }
+
+        let mut small_sample = DiscoveryShapeSample::default();
+        sample_discovery_shape(&small_root, &mut small_sample);
+        assert!(small_sample.within_serial_budget());
+        assert!(should_use_serial_discovery_fallback_on_windows(&[
+            small_root.clone()
+        ]));
+
+        let mut large_sample = DiscoveryShapeSample::default();
+        sample_discovery_shape(&large_root, &mut large_sample);
+        assert!(!large_sample.within_serial_budget());
+        assert!(!should_use_serial_discovery_fallback_on_windows(&[
+            large_root.clone()
+        ]));
+
+        let _ = fs::remove_dir_all(small_root);
+        let _ = fs::remove_dir_all(large_root);
     }
 
     #[test]

@@ -14,6 +14,7 @@ const requiredFiles = [
   "src/core/expr.zig",
   "src/core/search.zig",
   "src/core/regex.zig",
+  "src/core/trigram.zig",
   "src/core/inspect.zig",
 ];
 
@@ -35,7 +36,10 @@ describe("zig parity port contract", () => {
     const forbidden = [
       /std\.process\.Child/,
       /\bexec(File|Sync)?\s*\(/i,
-      /spawn(Sync)?/i,
+      /\bspawnSync\b/i,
+      /\bchild_process\b/i,
+      /\bCreateProcess\b/i,
+      /\bShellExecute\b/i,
       /\bcargo\b/i,
       /target[\\/](debug|release)[\\/]ix/i,
       /target[\\/](debug|release)[\\/]iex-cli/i,

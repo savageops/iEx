@@ -51,6 +51,13 @@ Build IX v2 as a simple, clean, capability-complete Rust search engine and bench
 - No backfill and no fallback shortcuts.
 - No split-brain architecture.
 
+### User-Exposed Pipeline Priority
+
+- Treat the operator-visible pipeline as the highest-value product surface: command input -> parsed intent -> execution phase -> visible metadata -> typed result sentinel -> next action.
+- Tests must prove the workflow a user, dashboard, transcript, or agent sees, not only private helper behavior. Cover command transcripts, search metadata, inspect continuation hints, JSON rows, error boundaries, progress/status records, and persisted report ownership when those surfaces are touched.
+- Expose observable provenance, command metadata, result state, timings, counts, and tool/search events. Do not expose hidden reasoning text; if the product needs explainability, emit structured rationale/provenance fields that are derived from code-visible state.
+- Any new feature must identify its most exposed user path before implementation and attach strict assertions to that path first.
+
 ### Deep Technical Research Standard
 
 When the user asks for deep research, interpret depth as implementation-level file-search knowledge: engine internals, byte scanning, regex execution strategy, automata construction, SIMD/memmem behavior, cache locality, branch behavior, allocation pressure, shard scheduling, reduction geometry, Windows I/O, corpus distribution, benchmark statistics, and source-level precedent from serious search engines. The research bar is below the public headline and inside the mechanism: source code, maintainer issue threads, benchmark harnesses, papers, talks, profiler traces, and failure reports that explain why a path is slow or fast.

@@ -2,11 +2,27 @@ use std::{fs, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use iex_core::{run_search, ExpressionPlan, SearchConfig};
+use iex_core::{run_search, ExpressionPlan, SearchConfig, SearchReport};
+
+use crate::agent_output::render_search_result_v1;
+
+const SEARCH_AFTER_HELP: &str = "EXPRESSION CONTRACT
+  ix search EXPR and ix matches EXPR use the canonical native IX expression surface
+  bare text is a literal substring: ix search 'a|b' searches for the bytes a|b
+  regex alternation requires re:pattern: ix search 're:a|b' .
+  literal alternation uses ||: ix search 'lit:a || lit:b' .
+  top-level ix PATTERN [PATH]... is an rg-shaped translator into this surface
+  translator regex patterns containing && or || are rejected as ambiguous
+AGENT OUTPUT
+  ix search emits hit records followed by one ix.result.v1 JSON sentinel
+  zero-match search is status:\"ok\" with matches:0, not an error
+  ix matches emits hit records only, no terminal result sentinel
+  --json emits the structured SearchReport contract";
 
 #[derive(Args, Debug, Clone)]
+#[command(after_help = SEARCH_AFTER_HELP)]
 pub struct SearchArgs {
-    #[arg(help = "Expression: lit:text | re:pattern | A && B | A || B")]
+    #[arg(help = "IX expression; bare text is literal, regex requires re:pattern")]
     pub expr: String,
 
     #[arg(
@@ -83,38 +99,106 @@ fn run_search_with_mode(args: SearchArgs, mode: SearchRenderMode) -> Result<()> 
         return Ok(());
     }
 
-    if !args.stats_only {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    write_search_text_output(&mut handle, &report, mode, args.stats_only)?;
+
+    Ok(())
+}
+
+fn write_search_text_output<W: Write>(
+    writer: &mut W,
+    report: &SearchReport,
+    mode: SearchRenderMode,
+    stats_only: bool,
+) -> Result<()> {
+    if !stats_only {
         for hit in &report.hits {
-            println!("{}:{}:{}:{}", hit.path, hit.line, hit.column, hit.preview);
+            writeln!(
+                writer,
+                "{}:{}:{}:{}",
+                hit.path, hit.line, hit.column, hit.preview
+            )?;
         }
     }
 
     if mode == SearchRenderMode::Search {
-        print_search_summary(&report);
+        writeln!(writer, "{}", render_search_result_v1(report))?;
     }
 
     Ok(())
 }
 
-fn print_search_summary(report: &iex_core::SearchReport) {
-    println!("-- IX Search Summary --");
-    println!("expression: {}", report.expression);
-    println!("files discovered: {}", report.stats.files_discovered);
-    println!("files scanned: {}", report.stats.files_scanned);
-    println!("files skipped: {}", report.stats.files_skipped);
-    println!("matches found: {}", report.stats.matches_found);
-    println!("bytes scanned: {}", report.stats.bytes_scanned);
-    println!(
-        "timings ms: discover={:.3} scan={:.3} aggregate={:.3} total={:.3}",
-        report.stats.timings.discover_ms,
-        report.stats.timings.scan_ms,
-        report.stats.timings.aggregate_ms,
-        report.stats.timings.total_ms,
-    );
-    if let Some(slowest) = report.stats.slowest_files.first() {
-        println!(
-            "slowest file: {} ({:.3} ms, {} bytes)",
-            slowest.path, slowest.duration_ms, slowest.bytes
-        );
+#[cfg(test)]
+mod tests {
+    use iex_core::{
+        stats::{SearchStats, SlowFileStat},
+        SearchHit,
+    };
+
+    use super::*;
+
+    #[test]
+    fn search_text_output_emits_exactly_one_result_v1() {
+        let report = sample_report(1);
+        let mut output = Vec::new();
+
+        write_search_text_output(&mut output, &report, SearchRenderMode::Search, false).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("ix.result.v1").count(), 1);
+        assert!(!output.contains(&["ix", ".search", ".summary"].concat()));
+        assert!(!output.contains(&["ix", ".search", ".timings_ms"].concat()));
+        assert!(!output.contains(&["ix", ".search", ".slowest"].concat()));
+    }
+
+    #[test]
+    fn matches_text_output_emits_no_result_sentinel() {
+        let report = sample_report(1);
+        let mut output = Vec::new();
+
+        write_search_text_output(&mut output, &report, SearchRenderMode::Matches, false).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("ix.result.v1").count(), 0);
+        assert!(output.contains("src/main.rs:7:3:needle"));
+    }
+
+    #[test]
+    fn stats_only_search_still_emits_terminal_state() {
+        let report = sample_report(0);
+        let mut output = Vec::new();
+
+        write_search_text_output(&mut output, &report, SearchRenderMode::Search, true).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains(r#""status":"ok""#));
+        assert!(output.contains(r#""matches":0"#));
+    }
+
+    fn sample_report(matches: usize) -> SearchReport {
+        let mut stats = SearchStats::default();
+        stats.matches_found = matches;
+        stats.files_discovered = 1;
+        stats.files_scanned = 1;
+        stats.bytes_scanned = 64;
+        stats.slowest_files.push(SlowFileStat {
+            path: "src\\main.rs".to_owned(),
+            duration_ms: 0.4,
+            bytes: 64,
+            linux_dominant_target: false,
+        });
+
+        SearchReport {
+            expression: "lit:needle".to_owned(),
+            hits: vec![SearchHit {
+                path: "src/main.rs".to_owned(),
+                line: 7,
+                column: 3,
+                preview: "needle".to_owned(),
+            }],
+            stats,
+        }
     }
 }

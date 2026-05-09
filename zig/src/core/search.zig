@@ -58,17 +58,21 @@ pub const SearchReport = struct {
 
 /// Entry point for the search engine. Orchestrates the full pipeline:
 ///   1. Deduplicate and prune overlapping root paths
-///   2. Discover all files (serial directory walk)
-///   3. Scan files in parallel across N threads
-///   4. Merge shard reports and aggregate timing
+///   2. Pre-spawn worker threads (overlapped with discovery)
+///   3. Discover all files (serial directory walk)
+///   4. Release gate — workers start scanning immediately
+///   5. Merge shard reports and aggregate timing
 ///
 /// PARALLELISM STRATEGY:
-/// Two-phase: discover files serially (fast readdir, <1ms for 500 files),
-/// then partition the file list across N worker threads. Each thread gets
-/// its own ShardReport (counters + hit buffer), avoiding all mutex overhead
-/// in the hot per-line matching path. Results are merged after all threads
-/// join. This matches Rust's parallel file scanning via Rayon, closing the
-/// large-directory performance gap.
+/// Three-phase with overlapped spawn: when any root is a directory, worker
+/// threads are spawned *before* discovery begins.  They spin on an atomic
+/// gate (std.atomic.spinLoopHint) until the file list is ready.  On
+/// Windows, CreateThread costs ~210μs per thread — overlapping spawn with
+/// the directory walk (≥0.5ms) hides this cost completely.  Once discovery
+/// finishes, the gate is released and workers enter the same atomic
+/// work-stealing loop as before: each thread fetchAdds a shared file
+/// counter, avoiding all partitioning or mutex overhead.  For non-directory
+/// roots (individual files), the serial path is taken directly.
 pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest, plan: expr.ExpressionPlan) !SearchReport {
     const total_started = std.Io.Timestamp.now(io, .awake);
     const roots = try prepareRoots(io, allocator, request);
@@ -118,10 +122,10 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     const discovered = file_list.items(allocator);
     const thread_count = effectiveThreadCount(request, discovered.len);
     report.outer_scan_threads = thread_count;
+
     if (discovered.len == 0) {
         // No files discovered — nothing to scan.
     } else if (thread_count <= 1 or discovered.len < 4) {
-        // Serial path: single thread or too few files to justify workers.
         for (discovered) |entry| {
             try scanDiscoveredFile(io, allocator, entry.path, request, plan, &report);
             if (report.truncated) break;
@@ -301,9 +305,6 @@ fn scanDiscoveredFile(
     plan: expr.ExpressionPlan,
     report: *SearchReport,
 ) anyerror!void {
-    // display_path is already normalized; open via the original-ish path.
-    // We re-derive a filesystem path by using display_path directly since
-    // we stored normalized forward-slash paths during discovery.
     const file = std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false }) catch |err| switch (err) {
         error.IsDir, error.AccessDenied => return,
         else => return err,

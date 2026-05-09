@@ -9,6 +9,7 @@
     "install:native:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/scripts/install-native.ps1",
     "install:native:unix": "bash tools/scripts/install-native.sh",
     "test": "vitest run --config vitest.config.ts",
+    "test:pressure": "vitest run --config vitest.config.ts --run tests/perf/search-explain-pressure.test.ts",
     "test:watch": "vitest --config vitest.config.ts",
     "bench:once": "node tools/scripts/run-once-benchmark.mjs",
     "bench:prepared:once": "node tools/scripts/run-once-prepared-benchmark.mjs",
@@ -23,6 +24,8 @@
     "bench:suite:download": "node tools/scripts/benchsuite-ripgrep.mjs download",
     "bench:suite:bootstrap-data": "node tools/scripts/benchsuite-data-bootstrap.mjs",
     "bench:suite:run": "node tools/scripts/benchsuite-ripgrep.mjs run",
+    "bench:matrix": "node tools/scripts/perf-case-matrix.mjs",
+    "bench:matrix:dry": "node tools/scripts/perf-case-matrix.mjs --dry-run",
     "dashboard": "node tools/scripts/dashboard-server.mjs",
     "materialize:tests": "node tools/scripts/materialize-tests.mjs"
   },

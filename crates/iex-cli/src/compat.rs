@@ -1,3 +1,16 @@
+//! Rg-shaped argv normalization for agents that call IX through ripgrep-shaped
+//! muscle memory.
+//!
+//! Boundary contract:
+//! - canonical IX CLI parsing runs first;
+//! - the accepted compatibility subset is intentionally narrow;
+//! - accepted input lowers into canonical [`SearchArgs`];
+//! - unsupported input fails with guided syntax instead of emulating ripgrep;
+//! - this module must not own file scanning, search execution, or report output.
+//!
+//! New capability belongs in the canonical command/search owners first. This
+//! layer may only translate argv into that capability after it exists.
+
 use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{bail, Result};
@@ -82,7 +95,7 @@ fn format_compat_parse_error(raw_args: &[OsString], kind: ErrorKind) -> String {
     if let Some(flag) = first_unsupported_compat_flag(raw_args) {
         let supported = "`ix PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, and `--hidden`";
         return format!(
-            "rg-style compatibility does not support `{flag}`. Supported subset: {supported}. Use `ix search <expr> [PATH]...` for native IX syntax."
+            "rg-shaped compatibility translator does not support `{flag}`. Supported subset: {supported}. Use canonical `ix search <expr> [PATH]...` for native IX syntax."
         );
     }
 
@@ -91,12 +104,12 @@ fn format_compat_parse_error(raw_args: &[OsString], kind: ErrorKind) -> String {
         ErrorKind::MissingRequiredArgument | ErrorKind::TooFewValues
     ) || compat_patterns_missing(raw_args)
     {
-        return "rg-style compatibility expects `ix PATTERN [PATH]...` or `ix -e <PATTERN> [PATH]...`.".to_owned();
+        return "rg-shaped compatibility translator expects `ix PATTERN [PATH]...` or `ix -e <PATTERN> [PATH]...`.".to_owned();
     }
 
     let supported = "`ix PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, and `--hidden`";
     format!(
-        "rg-style compatibility could not classify this search request. Supported subset: {supported}. Use `ix search <expr> [PATH]...` for native IX syntax."
+        "rg-shaped compatibility translator could not classify this search request. Supported subset: {supported}. Use canonical `ix search <expr> [PATH]...` for native IX syntax."
     )
 }
 
@@ -174,7 +187,7 @@ impl CompatSearchArgs {
         let (patterns, path_args): (Vec<String>, Vec<OsString>) = if self.regexps.is_empty() {
             let (pattern, paths) = self.positionals.split_first().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "rg-style compatibility expects `ix PATTERN [PATH]...` or `ix -e <PATTERN> [PATH]...`."
+                    "rg-shaped compatibility translator expects `ix PATTERN [PATH]...` or `ix -e <PATTERN> [PATH]...`."
                 )
             })?;
             (vec![os_string_to_string(pattern)?], paths.to_vec())
@@ -204,10 +217,9 @@ impl CompatSearchArgs {
 }
 
 fn os_string_to_string(value: &OsString) -> Result<String> {
-    value
-        .clone()
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("rg-style compatibility requires UTF-8 search patterns"))
+    value.clone().into_string().map_err(|_| {
+        anyhow::anyhow!("rg-shaped compatibility translator requires UTF-8 search patterns")
+    })
 }
 
 fn lower_compat_expression(
@@ -216,26 +228,26 @@ fn lower_compat_expression(
     ignore_case: bool,
 ) -> Result<String> {
     if patterns.is_empty() {
-        bail!("rg-style compatibility requires at least one search pattern");
+        bail!("rg-shaped compatibility translator requires at least one search pattern");
     }
 
-    if patterns.len() == 1 && looks_like_iex_expression(&patterns[0]) {
+    if patterns.iter().any(|pattern| pattern.trim().is_empty()) {
+        bail!("rg-shaped compatibility translator does not accept empty search patterns");
+    }
+
+    if patterns.len() == 1 && looks_like_explicit_iex_expression(&patterns[0]) {
         if fixed_strings || ignore_case {
             bail!(
-                "native IX expressions cannot be combined with `-F` or `-i` in rg-style compatibility mode. Use `ix search <expr> [PATH]...` instead."
+                "native IX expressions cannot be combined with `-F` or `-i` in rg-shaped translator mode. Use canonical `ix search <expr> [PATH]...` instead."
             );
         }
         return Ok(patterns[0].trim().to_owned());
     }
 
-    if patterns.iter().any(|pattern| pattern.trim().is_empty()) {
-        bail!("rg-style compatibility does not accept empty search patterns");
-    }
-
     if !fixed_strings
         && patterns
             .iter()
-            .any(|pattern| pattern.contains("&&") || pattern.contains("||"))
+            .any(|pattern| contains_ix_boolean_operator(pattern))
     {
         bail!(
             "regex patterns containing `&&` or `||` are ambiguous with native IX boolean operators. Use `ix search <expr> [PATH]...` for this pattern."
@@ -251,9 +263,9 @@ fn lower_compat_expression(
 
 fn lower_compat_pattern(pattern: &str, fixed_strings: bool, ignore_case: bool) -> String {
     if fixed_strings {
-        if ignore_case || pattern.contains("&&") || pattern.contains("||") {
+        if ignore_case || contains_ix_boolean_operator(pattern) {
             let prefix = if ignore_case { "(?i)" } else { "" };
-            return format!("re:{prefix}{}", regex_escape(pattern));
+            return format!("re:{prefix}{}", escape_literal_for_ix_regex(pattern));
         }
         return format!("lit:{pattern}");
     }
@@ -265,14 +277,55 @@ fn lower_compat_pattern(pattern: &str, fixed_strings: bool, ignore_case: bool) -
     format!("re:{pattern}")
 }
 
-fn looks_like_iex_expression(pattern: &str) -> bool {
+fn escape_literal_for_ix_regex(pattern: &str) -> String {
+    let mut escaped = String::new();
+    let mut literal_run = String::new();
+
+    for ch in pattern.chars() {
+        if ch == '&' {
+            if !literal_run.is_empty() {
+                escaped.push_str(&regex_escape(&literal_run));
+                literal_run.clear();
+            }
+            escaped.push_str(r"\x26");
+        } else {
+            literal_run.push(ch);
+        }
+    }
+
+    if !literal_run.is_empty() {
+        escaped.push_str(&regex_escape(&literal_run));
+    }
+
+    escaped
+}
+
+fn looks_like_explicit_iex_expression(pattern: &str) -> bool {
     let trimmed = pattern.trim();
-    trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.starts_with("lit:")
-        || trimmed.starts_with("re:")
-        || trimmed.starts_with("prefix:")
-        || trimmed.starts_with("suffix:")
+    if trimmed.contains("||") {
+        return trimmed
+            .split("||")
+            .map(str::trim)
+            .all(is_explicit_iex_predicate);
+    }
+    if trimmed.contains("&&") {
+        return trimmed
+            .split("&&")
+            .map(str::trim)
+            .all(is_explicit_iex_predicate);
+    }
+    is_explicit_iex_predicate(trimmed)
+}
+
+fn is_explicit_iex_predicate(token: &str) -> bool {
+    token.starts_with("lit:")
+        || token.starts_with("re:")
+        || token.starts_with("prefix:")
+        || token.starts_with("suffix:")
+}
+
+fn contains_ix_boolean_operator(pattern: &str) -> bool {
+    pattern.contains("&&") || pattern.contains("||")
 }
 
 #[cfg(test)]
@@ -280,14 +333,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compat_module_stays_translation_only() {
+        let source = include_str!("compat.rs");
+        let forbidden_tokens = [
+            ["use ", "iex_core"].concat(),
+            ["iex_core", "::"].concat(),
+            ["run_", "search("].concat(),
+            ["run_", "search_prepared"].concat(),
+            ["Search", "Config"].concat(),
+            ["Search", "Report"].concat(),
+            ["print_", "search_summary"].concat(),
+            ["std::", "fs"].concat(),
+        ];
+
+        for token in forbidden_tokens {
+            assert!(
+                !source.contains(&token),
+                "compat layer must stay argv normalization only; found forbidden token `{token}`"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_search_keeps_bare_expression_untranslated() {
+        let invocation = route_invocation(vec![
+            OsString::from("ix"),
+            OsString::from("search"),
+            OsString::from("a|b"),
+            OsString::from("src"),
+        ])
+        .expect("canonical parse should succeed before compat routing");
+
+        match invocation {
+            Invocation::Canonical(Command::Search(args)) => {
+                assert_eq!(args.expr, "a|b");
+                assert_eq!(args.paths, vec![PathBuf::from("src")]);
+            }
+            _ => panic!("canonical search should bypass compatibility translator"),
+        }
+    }
+
+    #[test]
     fn compat_bare_pattern_lowers_to_regex() {
-        let compat = try_parse_compat_args(&[OsString::from("timeout"), OsString::from("src")])
+        let compat = try_parse_compat_args(&[OsString::from("a|b"), OsString::from("src")])
             .expect("compat parse should succeed");
         let search = compat
             .into_search_args()
             .expect("compat lowering should succeed");
 
-        assert_eq!(search.expr, "re:timeout");
+        assert_eq!(search.expr, "re:a|b");
         assert_eq!(search.paths, vec![PathBuf::from("src")]);
     }
 
@@ -300,6 +394,70 @@ mod tests {
             .expect("native expression should pass through");
 
         assert_eq!(search.expr, "lit:timeout");
+    }
+
+    #[test]
+    fn compat_preserves_explicit_native_boolean_expression() {
+        let compat = try_parse_compat_args(&[
+            OsString::from("lit:IX && lit:Rust"),
+            OsString::from("README.md"),
+        ])
+        .expect("compat parse should succeed");
+        let search = compat
+            .into_search_args()
+            .expect("explicit native expression should pass through");
+
+        assert_eq!(search.expr, "lit:IX && lit:Rust");
+        assert_eq!(search.paths, vec![PathBuf::from("README.md")]);
+    }
+
+    #[test]
+    fn compat_rejects_ambiguous_regex_boolean_operators() {
+        let compat = try_parse_compat_args(&[
+            OsString::from("-e"),
+            OsString::from("IX&&Rust"),
+            OsString::from("README.md"),
+        ])
+        .expect("compat parse should succeed");
+        let error = compat
+            .into_search_args()
+            .expect_err("ambiguous rg-shaped regex should fail guided");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("ambiguous with native IX boolean operators"));
+        assert!(message.contains("ix search <expr> [PATH]..."));
+    }
+
+    #[test]
+    fn compat_rejects_ambiguous_regex_alternation_operator_shape() {
+        let compat = try_parse_compat_args(&[
+            OsString::from("-e"),
+            OsString::from("a||b"),
+            OsString::from("README.md"),
+        ])
+        .expect("compat parse should succeed");
+        let error = compat
+            .into_search_args()
+            .expect_err("ambiguous rg-shaped regex should fail guided");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("ambiguous with native IX boolean operators"));
+    }
+
+    #[test]
+    fn compat_fixed_string_boolean_operators_lower_to_safe_regex() {
+        let compat = try_parse_compat_args(&[
+            OsString::from("-F"),
+            OsString::from("IX&&Rust"),
+            OsString::from("README.md"),
+        ])
+        .expect("compat parse should succeed");
+        let search = compat
+            .into_search_args()
+            .expect("fixed string boolean operators should lower safely");
+
+        assert_eq!(search.expr, r"re:IX\x26\x26Rust");
+        assert_eq!(search.paths, vec![PathBuf::from("README.md")]);
     }
 
     #[test]

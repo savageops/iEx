@@ -2,21 +2,21 @@
 
 # IX-Zig
 
-**High-performance search engine with AVX2 SIMD acceleration, strategy-aware regex bypass, and lock-free parallel file scanning.**
+**Zig candidate lane for IX exact search, AVX2 SIMD kernels, strategy-aware regex bypass, and the next exact trigram acceleration substrate.**
 
-*Zero-mutex hot path &middot; 32 bytes/cycle vectorized throughput &middot; thread-local shard accumulation &middot; compile-time dispatch*
+*Candidate binary &middot; Rust-oracle parity &middot; 32 bytes/cycle vectorized throughput &middot; exact retrieval substrate trajectory*
 
 ---
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX2%20256--bit-0071C5?logo=intel&logoColor=white)](#simd-acceleration-architecture)
 [![StringZilla](https://img.shields.io/badge/StringZilla-v4.6.0-8839ef)](#simd-acceleration-architecture)
-[![Benchmark](https://img.shields.io/badge/Benchmark-12%2F12%20Wins-brightgreen)](#benchmark-evidence)
+[![Benchmark](https://img.shields.io/badge/Benchmark-Zig%203%2F12%20latest-f59e0b)](#benchmark-evidence)
 [![Lock Free](https://img.shields.io/badge/Hot%20Path-Lock--Free-ff6b6b)](#parallel-file-scanner)
 [![Threads](https://img.shields.io/badge/Threads-Auto--Scaled-29b6f6)](#parallel-file-scanner)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0f766e)](../LICENSE)
 
-[Architecture](#architecture-overview) · [SIMD](#simd-acceleration-architecture) · [Regex](#regex-engine) · [Parallel Scanner](#parallel-file-scanner) · [Benchmarks](#benchmark-evidence) · [Build](#build-contract) · [Source](#source-layout)
+[Architecture](#architecture-overview) · [Exact Trigram](#exact-trigram-acceleration) · [SIMD](#simd-acceleration-architecture) · [Regex](#regex-engine) · [Parallel Scanner](#parallel-file-scanner) · [Benchmarks](#benchmark-evidence) · [Build](#build-contract) · [Source](#source-layout)
 
 </div>
 
@@ -24,12 +24,14 @@
 
 > [!NOTE]
 > This directory is the only Zig implementation lane for IX. The Rust binary in `../crates` remains the oracle until the Zig binary proves identical command taxonomy, identical result-state behavior, identical match counts on the shared fixture matrix, no shell delegation, and neutral-or-better benchmark evidence.
+>
+> Current local proof keeps Zig as a candidate lane, not the canonical binary. The newest full-suite matrix preserved parity and scored Rust `9/12`, Zig `3/12`. This is candidate evidence for the rebuilt artifact, not proof that exact trigram acceleration is active; the trigram slice currently owns admission semantics only.
 
 ---
 
 ## Architecture Overview
 
-IX-Zig is built on four interlocking acceleration layers. Each layer targets a different bottleneck in the search pipeline — together they produce **sub-millisecond latency on small files** and **linear core scaling on large directory trees**.
+IX-Zig is built as a mechanism-for-mechanism translation and attack surface against IX's Rust cost model. The implemented lane currently proves SIMD literal acceleration, Zig-owned regex execution for the tested IX operator set, canonical output parity, and candidate benchmark wins on selected small/medium/real-codebase lanes. The next architectural target is larger than another scanner pass: make Zig the first IX lane to materialize exact trigram acceleration as a persistent candidate layer while preserving the same `ix search` command surface.
 
 | Layer | Technique | Throughput | Section |
 |:------|:----------|:-----------|:--------|
@@ -37,30 +39,54 @@ IX-Zig is built on four interlocking acceleration layers. Each layer targets a d
 | **Strategy-Aware Regex Bypass** | Compile-time pattern classification into 8 strategy tiers — structural literals, casefold literals, word-boundary literals, and alternation sets route directly to SIMD search, bypassing the backtracking engine | `90%+ regex predicates at SIMD speed` | [Details](#strategy-aware-dispatch-regex-bypass-engine) |
 | **Literal Prefix Prefilter** | Leading literal extraction from regex AST fed into AVX2 `memmem` rejection — lines without the literal prefix are discarded before the regex VM fires | `~95% line rejection rate` | [Details](#strategy-aware-dispatch-regex-bypass-engine) |
 | **Lock-Free Parallel File Scanner** | Two-phase discover-then-scan with `std.Thread.spawn`, static file partitioning, thread-local `ShardReport` accumulation, zero-mutex hot path | `Linear core scaling` | [Details](#parallel-file-scanner) |
+| **Exact Trigram Acceleration** | Planned persistent corpus epoch: mandatory trigrams prune impossible files, exact verifier still owns every emitted hit | `Sublinear candidate set` | [Details](#exact-trigram-acceleration) |
 
 ---
 
 ## Build Contract
 
+Pinned toolchain target: Zig `0.16.0`. During parity certification, `ix-zig` must not replace the Rust `ix` binary. A new Zig candidate is admissible only when it lands at the canonical candidate path below and passes the same Rust-oracle gates.
+
 <table>
-<tr><td><strong>Toolchain</strong></td><td>Zig <code>0.16.0</code></td></tr>
+<tr><td><strong>Repo root</strong></td><td><code>E:\Workspaces\01_Projects\01_Github\iEx</code></td></tr>
+<tr><td><strong>Rust oracle</strong></td><td><code>E:\Workspaces\01_Projects\01_Github\iEx\target\release\ix.exe</code></td></tr>
+<tr><td><strong>Zig candidate</strong></td><td><code>E:\Workspaces\01_Projects\01_Github\iEx\zig\zig-out\bin\ix-zig.exe</code></td></tr>
 <tr><td><strong>Compiler</strong></td><td><code>C:\Users\Savage\.local\zig\zig-x86_64-windows-0.16.0\zig.exe</code></td></tr>
-<tr><td><strong>Binary</strong></td><td><code>ix-zig</code> (parity phase — does not replace the Rust <code>ix</code> binary)</td></tr>
+<tr><td><strong>Harness</strong></td><td><code>E:\Workspaces\01_Projects\01_Github\iEx\tests\perf\zig-vs-rust-search.test.ts</code></td></tr>
+<tr><td><strong>Report</strong></td><td><code>E:\Workspaces\01_Projects\01_Github\iEx\tools\reports\zig-vs-rust-latest.json</code></td></tr>
 </table>
 
-```sh
-zig version
-cd zig
-zig build --summary all          # debug
-zig build test --summary all     # unit tests
-zig build -Doptimize=ReleaseFast --summary all  # release
+### Canonical Build
+
+```powershell
+cd E:\Workspaces\01_Projects\01_Github\iEx
+cargo build --release -p iex-cli
+
+cd .\zig
+& C:\Users\Savage\.local\zig\zig-x86_64-windows-0.16.0\zig.exe build test --summary all
+& C:\Users\Savage\.local\zig\zig-x86_64-windows-0.16.0\zig.exe build -Doptimize=ReleaseFast --summary all
+
+cd ..
+```
+
+### Gate Commands
+
+```powershell
+# Focused Zig correctness gate
+npm test -- --run tests/zig/zig-runtime-parity.test.ts tests/zig/zig-port-contract.test.ts
+
+# Main Rust-oracle vs Zig-candidate benchmark
+npm test -- --run tests/perf/zig-vs-rust-search.test.ts
+
+# Full repository suite
+npm test
 ```
 
 ---
 
 ## Performance Status
 
-Three optimization layers combine to produce **dominant performance across all 12 benchmark cases**:
+Zig is valid and improving, but the current candidate lane has not replaced Rust. The latest full-suite matrix kept match-count and byte-scanned parity and scored **Rust 9/12, Zig 3/12**. Zig won `single-file-literal` plus both real-codebase lanes; Rust won every medium-directory lane and every large-directory lane in the final report. Promotion still requires broader repeated proof because the exact trigram planner is not wired into runtime pruning yet.
 
 | Optimization | Technique | Scope |
 |:-------------|:----------|:------|
@@ -68,32 +94,80 @@ Three optimization layers combine to produce **dominant performance across all 1
 | ![Dispatch](https://img.shields.io/badge/-Dispatch-9333ea?style=flat-square) **Strategy-Aware Dispatch** | Regex bypass via compile-time pattern classification | 90%+ of regex predicates routed to SIMD literals |
 | ![Prefilter](https://img.shields.io/badge/-Prefilter-ea580c?style=flat-square) **Literal Prefix Prefilter** | SIMD rejection of non-matching lines before regex fires | ~95% of lines skipped for `regex_full` patterns |
 | ![Parallel](https://img.shields.io/badge/-Parallel-16a34a?style=flat-square) **Parallel File Scanner** | Thread-per-shard with lock-free accumulation | Multi-file directory scans scale with core count |
+| ![Index](https://img.shields.io/badge/-Trigram-f59e0b?style=flat-square) **Exact Trigram Acceleration** | Persistent candidate-file pruning before scan | Planned next substrate slice |
 
 ### Benchmark Evidence
 
-Test harness: `tests/perf/zig-vs-rust-search.test.ts` — 1 warmup + 5 measured runs, interleaved execution, median selection. Values below `1.00x` = Zig faster.
+Test harness: `tests/perf/zig-vs-rust-search.test.ts` — interleaved execution, median selection, and Rust-oracle match-count parity. Values below `1.00x` = Zig faster.
+
+The harness runs both binaries as:
+
+```text
+search <expression> <corpus> --json --stats-only
+```
+
+Generated fixture root: `C:\Users\Savage\AppData\Local\Temp\ix-zig-vs-rust-bench`.
+
+| Fixture | Source |
+|:--------|:-------|
+| `small.txt` | Generated single-file fixture |
+| `medium\` | Generated medium-directory fixture |
+| `large\` | Generated large-directory fixture |
+| `crates` | Real corpus at `E:\Workspaces\01_Projects\01_Github\iEx\crates` |
+
+| Case | Expression | Corpus |
+|:-----|:-----------|:-------|
+| `single-file-literal` | `lit:needle` | `small.txt` |
+| `single-file-regex` | `re:needle` | `small.txt` |
+| `medium-dir-literal` | `lit:needle` | `medium` |
+| `medium-dir-regex-alternation` | `re:TODO\|FIXME` | `medium` |
+| `medium-dir-word-boundary` | `re:\bsession\b` | `medium` |
+| `large-dir-literal` | `lit:needle` | `large` |
+| `large-dir-regex` | `re:process_\d+_\d+` | `large` |
+| `large-dir-case-insensitive` | `re:(?i)sherlock` | `large` |
+| `large-dir-boolean-and` | `lit:Result && lit:process` | `large` |
+| `large-dir-prefix` | `prefix:pub fn` | `large` |
+| `real-codebase-literal` | `lit:SearchConfig` | `crates` |
+| `real-codebase-regex` | `re:fn\s+\w+` | `crates` |
+
+Scoring contract:
+
+```text
+warmup_runs = 1
+sample_runs = 5
+winner = median wall time
+required_parity = match_count && bytes_scanned
+report_fields = wall_ms, engine_ms, scan_ms, counts, bytes, winner
+```
+
+To test a new Zig build, produce `zig\zig-out\bin\ix-zig.exe`, then run:
+
+```powershell
+cd E:\Workspaces\01_Projects\01_Github\iEx
+npm test -- --run tests/perf/zig-vs-rust-search.test.ts
+```
 
 <details>
-<summary><strong>Full optimization progression table</strong></summary>
+<summary><strong>Latest recorded matrix snapshot</strong></summary>
 
-| Case | Baseline (scalar) | + StringZilla SIMD | + Strategy Dispatch | + Parallel Scanner |
-|:-----|:------------------|:------------------|:-------------------|:-------------------|
-| `single-file-literal` | 1.09x | 0.93x | 0.98x | **0.94x** |
-| `single-file-regex` | — | — | 0.96x | **0.96x** |
-| `medium-dir-literal` | 2.47x | 1.42x | 0.81x | **0.83x** |
-| `medium-dir-regex-alternation` | — | — | 0.81x | **0.85x** |
-| `medium-dir-word-boundary` | — | — | 0.80x | **0.86x** |
-| `large-dir-literal` | 5.30x | 3.45x | 1.14x | **0.87x** |
-| `large-dir-regex` | 11.44x | 11.76x | 1.14x | **0.80x** |
-| `large-dir-case-insensitive` | 12.81x | 13.07x | 1.25x | **0.85x** |
-| `large-dir-boolean-and` | 5.88x | 3.12x | 1.15x | **0.77x** |
-| `large-dir-prefix` | 5.60x | 3.56x | 1.11x | **0.85x** |
-| `real-codebase-literal` | 1.09x | 0.93x | 0.78x | **0.85x** |
-| `real-codebase-regex` | — | — | 0.73x | **0.79x** |
+| Lane | Rust | Zig | Winner |
+|:-----|:-----|:----|:-------|
+| `single-file-literal` | `43.3 ms` | `40.4 ms` | Zig |
+| `single-file-regex` | `27.8 ms` | `28.4 ms` | Rust |
+| `medium-dir-literal` | `23.0 ms` | `24.8 ms` | Rust |
+| `medium-dir-regex-alternation` | `22.1 ms` | `26.6 ms` | Rust |
+| `medium-dir-word-boundary` | `22.8 ms` | `23.8 ms` | Rust |
+| `large-dir-literal` | `27.6 ms` | `45.8 ms` | Rust |
+| `large-dir-regex` | `30.1 ms` | `39.1 ms` | Rust |
+| `large-dir-case-insensitive` | `29.8 ms` | `63.4 ms` | Rust |
+| `large-dir-boolean-and` | `31.1 ms` | `37.5 ms` | Rust |
+| `large-dir-prefix` | `30.8 ms` | `33.3 ms` | Rust |
+| `real-codebase-literal` | `27.4 ms` | `24.2 ms` | Zig |
+| `real-codebase-regex` | `26.8 ms` | `23.2 ms` | Zig |
 
 </details>
 
-> **Result: 12/12 benchmark cases won.** Best result: **0.77x** on `large-dir-boolean-and` (23% faster). Match count parity: 100%.
+> **Current decision:** candidate retained, canonical Rust binary not replaced. The latest full-suite report is favorable to Rust; exact trigram acceleration is not yet on the runtime path. This slice proves query-admission semantics and keeps the verifier as the authority.
 
 ### Remaining Optimization Opportunities
 
@@ -103,6 +177,88 @@ Test harness: `tests/perf/zig-vs-rust-search.test.ts` — 1 warmup + 5 measured 
 | **Multi-pattern search** | Sequential predicate evaluation | Aho-Corasick automaton for `\|\|` literals | N-way literal search in single pass |
 | **Case-insensitive SIMD** | Scalar `toLower` per byte | XOR 0x20 casefold + SIMD comparison | Further improvement on case-insensitive patterns |
 | **Byte-shard fast count** | Single-threaded line-by-line count | Split file into ranges, count per thread, merge | Linear scaling for stats-only |
+| **Exact trigram acceleration** | Every search still enters scan unless current fast paths reject line/file work | Persistent corpus epoch + mandatory-trigram pruning + exact verifier | Changes the cost model from scan-first to candidate-first |
+
+---
+
+## Exact Trigram Acceleration
+
+Exact trigram acceleration is the next Zig lane that can make the scanner race smaller. It is a first-class IX acceleration layer: the planner extracts mandatory byte evidence, a persistent corpus epoch narrows candidate files, and the exact verifier remains responsible for every emitted hit.
+
+```text
+ix search EXPR [PATH]...
+  -> canonical argv lowering
+  -> ExpressionPlan
+  -> mandatory evidence extraction
+       |-- literals
+       |-- anchors
+       |-- fixed-width regex windows
+       `-- trigrams
+  -> corpus epoch lookup when valid
+  -> candidate file set
+  -> exact byte verifier
+  -> ix.result.v1 / SearchReport
+```
+
+The invariant is non-negotiable:
+
+```text
+trigram index may remove files from consideration
+trigram index may not create a hit
+current bytes remain the authority for every emitted match
+```
+
+### Corpus Epoch Contract
+
+The Zig implementation should treat the index as a crash-recoverable epoch, not a loose cache. A valid epoch proves the candidate set is safe to use. An invalid, partial, stale, or unsupported epoch is ignored and the existing scan path runs. Operators use the same `ix search` surface; report provenance can show whether exact trigram acceleration participated.
+
+| Component | Contract |
+|:----------|:---------|
+| `FileId` table | Stable file identity, canonical path, size, mtime, and partial hash evidence |
+| Trigram sketch | Presence-only byte evidence, stored compactly enough for fast intersection |
+| Generation checkpoint | Completed marker written after all file rows and posting lists are durable |
+| Invalidation guard | Conservative rejection on path drift, timestamp mismatch, size mismatch, partial write, symlink ambiguity, or binary-policy change |
+| Verifier handoff | Candidate files feed existing Zig search/matcher code; match rows still come from byte verification |
+| Provenance | Search report must expose epoch activation, candidate count, rejected file count, verifier count, and fallback reason |
+
+### Query Admission
+
+Not every expression is eligible. The planner may use exact trigram acceleration only when it can prove mandatory byte evidence:
+
+| Expression shape | Admission |
+|:-----------------|:----------|
+| `lit:abcd` | eligible: trigrams `abc`, `bcd` are mandatory |
+| `prefix:abcd` | eligible: same mandatory trigrams, plus line-start verifier |
+| `suffix:abcd` | eligible: same mandatory trigrams, plus line-end verifier |
+| `lit:auth && lit:token` | eligible: intersect rarest mandatory trigrams first |
+| `lit:auth || lit:token` | eligible only as union of independent candidate sets |
+| `re:auth_\d+` | eligible when prefix/literal extraction proves `aut`, `uth`, `th_` |
+| `re:\w+` | not eligible: no mandatory trigram |
+| non-ASCII casefold regex | timing-only until exact match-count parity and width semantics are proven |
+
+The planner should order conjunctions by selectivity, not source order. If `lit:auth && lit:x` appears, the rarest safe trigram set runs first; high-frequency evidence becomes verifier context.
+
+### Corpus Epoch Maintenance
+
+The first search must not wait for the index. Search returns through the existing exact path, then a bounded background worker may update the corpus epoch for the roots it just touched. The next search can use the epoch if and only if the checkpoint is complete and every queried file identity validates. If maintenance is absent, cancelled, incomplete, or stale, the user sees the same command contract and the verifier remains authoritative.
+
+```text
+search now
+  -> exact result
+  -> schedule epoch maintenance after response boundary
+  -> tail worker records corpus facts
+       -> file rows
+       -> trigram posting lists
+       -> checkpoint
+next search
+  -> validate epoch
+  -> prune candidates
+  -> exact verifier
+```
+
+Benchmark reports may expose epoch activation, candidate pruning, verifier counts, and fallback reason for reproducibility. The feature should be framed directly as exact trigram acceleration inside the normal IX toolkit.
+
+This is where Zig can stop competing on politeness. Rust can remain an excellent scanner. Zig can make scanning rare.
 
 ---
 
@@ -430,7 +586,7 @@ The scanner auto-detects CPU core count via `std.Thread.getCpuCount()` and caps 
 
 ### Parallel Scanner Impact
 
-This optimization **flipped every large-directory benchmark**:
+Candidate artifacts have shown large wins from two-phase scanning, but the latest full-suite report has Rust winning every large-directory lane. Treat the scanner as a valid mechanism, not replacement authorization by itself:
 
 | Case | Before (serial) | After (parallel) | Delta |
 |:-----|:----------------|:-----------------|:------|
@@ -439,6 +595,8 @@ This optimization **flipped every large-directory benchmark**:
 | `large-dir-case-insensitive` | 1.25x | **0.85x** | -32% |
 | `large-dir-boolean-and` | 1.15x | **0.77x** | -33% |
 | `large-dir-prefix` | 1.11x | **0.85x** | -23% |
+
+Those ratios remain useful as mechanism evidence. The current promotion state is still candidate-only until repeated suite proof, runtime provenance, and canonical-loop ownership are closed.
 
 ---
 
@@ -656,12 +814,12 @@ Cache-line alignment (`align(64)`) on the global report fields prevents false sh
 ### Tier 5: Research Frontier — Sublinear Search, Compressed Indices, Hardware-Aware Scheduling
 
 <details>
-<summary><strong>Trigram Index with Inverted Posting Lists (Google Code Search Architecture)</strong></summary>
+<summary><strong>Posting-list backend for exact trigram acceleration</strong></summary>
 
-Instead of scanning every file for every query, pre-build an index that maps every 3-byte sequence (trigram) to the set of files containing it. At query time, decompose the search pattern into trigrams, intersect their posting lists, and only scan the surviving candidate files.
+The substrate section above describes the product contract. The storage backend can be an inverted trigram index: every 3-byte sequence maps to the files that contain it. At query time, the planner decomposes mandatory evidence into trigrams, intersects posting lists, and sends only surviving candidate files to the exact verifier.
 
 ```
-Index construction (one-time cost):
+Epoch construction:
   File "auth.zig" contains bytes: [a,u,t,h,.,z,i,g,...]
   Trigrams: "aut", "uth", "th.", "h.z", ".zi", "zig"
   Posting list: trigram "aut" → {auth.zig, auth_test.zig, oauth.zig}
@@ -674,9 +832,9 @@ Query: "auth"
   Full scan: only 3 files instead of 10,000+
 ```
 
-For large codebases (100K+ files), the trigram intersection reduces candidate files by 99%+. The index is compact: 256³ = 16.7 million possible trigrams, but real code uses only ~100K unique trigrams. A hash map from trigram → compressed posting list fits in ~10 MB for a million-file codebase. The posting lists use delta-encoded variable-length integers (varint) for further compression.
+For large codebases, trigram intersection can reduce candidate files by orders of magnitude before scan begins. The exact numbers are corpus-dependent and must be reported from the benchmark artifact, not asserted as a universal property. The compact shape remains attractive: 256^3 = 16.7 million possible trigrams, while real source trees use a much smaller active subset. Posting lists can be delta-encoded with varints and memory-mapped for direct traversal.
 
-**Index persistence:** Write the trigram index to a memory-mapped file. On subsequent searches, `mmap` the index (zero deserialization cost) and perform posting list intersection directly on the mapped pages. Index invalidation uses file modification timestamps — only rebuild posting lists for changed files (incremental update).
+**Epoch persistence:** Write the trigram index to a memory-mapped file only after file rows and posting lists are complete. Subsequent searches can map the epoch with near-zero deserialization overhead and perform posting-list intersection directly on mapped pages. Invalidation must use conservative file identity evidence, not timestamps alone: path, size, mtime, partial hash, symlink state, and binary policy all participate in the validity check.
 
 </details>
 

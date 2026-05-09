@@ -46,6 +46,8 @@ pub struct InspectWindowReport {
     pub path: String,
     pub requested: InspectWindowBounds,
     pub total_emitted_lines: usize,
+    pub eof: bool,
+    pub total_lines: Option<usize>,
     pub lines: Vec<InspectLine>,
 }
 
@@ -70,9 +72,12 @@ pub fn inspect_window(request: &InspectWindowRequest) -> Result<InspectWindowRep
         .with_context(|| format!("failed to open {}", request.path.display()))?;
     let reader = BufReader::new(file);
     let mut lines = Vec::new();
+    let mut observed_last_line = 0usize;
+    let mut stopped_before_eof = false;
 
     for (index, line) in reader.lines().enumerate() {
         let line_number = index + 1;
+        observed_last_line = line_number;
         if line_number < bounds.start_line {
             continue;
         }
@@ -80,9 +85,11 @@ pub fn inspect_window(request: &InspectWindowRequest) -> Result<InspectWindowRep
             .end_line
             .is_some_and(|end_line| line_number > end_line)
         {
+            stopped_before_eof = true;
             break;
         }
         if bounds.limit.is_some_and(|limit| lines.len() >= limit) {
+            stopped_before_eof = true;
             break;
         }
 
@@ -102,6 +109,8 @@ pub fn inspect_window(request: &InspectWindowRequest) -> Result<InspectWindowRep
     Ok(InspectWindowReport {
         path: request.path.display().to_string(),
         total_emitted_lines: lines.len(),
+        eof: !stopped_before_eof,
+        total_lines: (!stopped_before_eof).then_some(observed_last_line),
         requested: bounds,
         lines,
     })
@@ -161,6 +170,8 @@ mod tests {
         let report = inspect_window(&InspectWindowRequest::first(&path, 2)).unwrap();
 
         assert_eq!(report.total_emitted_lines, 2);
+        assert!(!report.eof);
+        assert_eq!(report.total_lines, None);
         assert_eq!(report.lines[0].line, 1);
         assert_eq!(report.lines[0].text, "one");
         assert_eq!(report.lines[1].line, 2);
@@ -215,6 +226,19 @@ mod tests {
 
         assert!(report.lines.is_empty());
         assert_eq!(report.total_emitted_lines, 0);
+        assert!(report.eof);
+        assert_eq!(report.total_lines, Some(1));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn full_bounded_window_marks_eof_when_exactly_at_file_end() {
+        let path = fixture("one\ntwo\n");
+        let report = inspect_window(&InspectWindowRequest::first(&path, 2)).unwrap();
+
+        assert_eq!(report.total_emitted_lines, 2);
+        assert!(report.eof);
+        assert_eq!(report.total_lines, Some(2));
         let _ = fs::remove_file(path);
     }
 
